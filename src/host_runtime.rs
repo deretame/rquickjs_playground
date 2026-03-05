@@ -15,7 +15,7 @@ impl HostRuntime {
         context.with(|ctx| {
             install_host_bindings(&ctx)?;
             ctx.eval::<(), _>(WEB_POLYFILL)?;
-            if load_axios {
+            if load_axios && !AXIOS_BUNDLE.is_empty() {
                 ctx.eval::<(), _>(AXIOS_BUNDLE)?;
             }
             Ok::<(), rquickjs::Error>(())

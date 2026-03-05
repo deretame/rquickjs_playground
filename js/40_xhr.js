@@ -46,6 +46,14 @@
       this._responseHeaders = new Headers();
       this._aborted = false;
       this._sent = false;
+      this._requestId = null;
+      this.offloaded = false;
+      this.nativeBufferId = null;
+      this.offloadedBytes = 0;
+      this.wasiApplied = false;
+      this.wasiNeedJsProcessing = false;
+      this.wasiFunction = null;
+      this.wasiOutputType = null;
     }
 
     open(method, url, async = true) {
@@ -59,6 +67,13 @@
       this.responseText = "";
       this.status = 0;
       this.statusText = "";
+      this.offloaded = false;
+      this.nativeBufferId = null;
+      this.offloadedBytes = 0;
+      this.wasiApplied = false;
+      this.wasiNeedJsProcessing = false;
+      this.wasiFunction = null;
+      this.wasiOutputType = null;
       this._headers = new Headers();
       this._responseHeaders = new Headers();
       this._setReadyState(XMLHttpRequest.OPENED);
@@ -87,6 +102,13 @@
 
     abort() {
       this._aborted = true;
+      if (this._requestId !== null) {
+        try {
+          globalThis.__http_request_drop(this._requestId);
+        } catch (_err) {
+        }
+        this._requestId = null;
+      }
       if (this.readyState === XMLHttpRequest.UNSENT || this.readyState === XMLHttpRequest.DONE) {
         return;
       }
@@ -107,46 +129,102 @@
       nextTick(() => {
         if (this._aborted) return;
         const start = Date.now();
+        const fail = (type) => {
+          this._requestId = null;
+          this._setReadyState(XMLHttpRequest.DONE);
+          this.dispatchEvent({ type, target: this });
+          this.dispatchEvent({ type: "loadend", target: this });
+        };
+
+        const dropPending = () => {
+          if (this._requestId === null) return;
+          try {
+            globalThis.__http_request_drop(this._requestId);
+          } catch (_err) {
+          }
+          this._requestId = null;
+        };
 
         try {
-          const raw = globalThis.__http_request(
+          const startedRaw = globalThis.__http_request_start(
             this._method,
             this._url,
             JSON.stringify(this._headers.toObject()),
             parseBodyValue(body) ?? null,
           );
-          const payload = JSON.parse(raw);
-
-          if (!payload.ok) {
-            this._setReadyState(XMLHttpRequest.DONE);
-            this.dispatchEvent({ type: "error", target: this });
-            this.dispatchEvent({ type: "loadend", target: this });
+          const started = JSON.parse(startedRaw);
+          if (!started.ok) {
+            fail("error");
             return;
           }
 
-          if (this.timeout > 0 && Date.now() - start > this.timeout) {
+          this._requestId = Number(started.id);
+
+          const poll = () => {
+            if (this._aborted) {
+              dropPending();
+              return;
+            }
+
+            if (this.timeout > 0 && Date.now() - start > this.timeout) {
+              dropPending();
+              fail("timeout");
+              return;
+            }
+
+            let step;
+            try {
+              step = JSON.parse(globalThis.__http_request_try_take(this._requestId));
+            } catch (_err) {
+              dropPending();
+              fail("error");
+              return;
+            }
+
+            if (!step.ok) {
+              fail("error");
+              return;
+            }
+
+            if (!step.done) {
+              setTimeout(poll, 0);
+              return;
+            }
+
+            this._requestId = null;
+
+            const payload = JSON.parse(step.result || "{}");
+
+            if (!payload.ok) {
+              fail("error");
+              return;
+            }
+
+            this.status = payload.status || 0;
+            this.statusText = payload.statusText || "";
+            this.responseURL = payload.url || this._url;
+            this.offloaded = payload.offloaded === true;
+            this.nativeBufferId = this.offloaded ? Number(payload.nativeBufferId || 0) : null;
+            this.offloadedBytes = Number(payload.offloadedBytes || 0);
+            this.wasiApplied = payload.wasiApplied === true;
+            this.wasiNeedJsProcessing = payload.wasiNeedJsProcessing === true;
+            this.wasiFunction = payload.wasiFunction || null;
+            this.wasiOutputType = payload.wasiOutputType || null;
+            this._responseHeaders = new Headers(payload.headers || {});
+            this._setReadyState(XMLHttpRequest.HEADERS_RECEIVED);
+
+            this.responseText = String(payload.body || "");
+            this._setReadyState(XMLHttpRequest.LOADING);
             this._setReadyState(XMLHttpRequest.DONE);
-            this.dispatchEvent({ type: "timeout", target: this });
+
+            this.dispatchEvent({ type: "load", target: this });
             this.dispatchEvent({ type: "loadend", target: this });
-            return;
-          }
+          };
 
-          this.status = payload.status || 0;
-          this.statusText = payload.statusText || "";
-          this.responseURL = payload.url || this._url;
-          this._responseHeaders = new Headers(payload.headers || {});
-          this._setReadyState(XMLHttpRequest.HEADERS_RECEIVED);
-
-          this.responseText = String(payload.body || "");
-          this._setReadyState(XMLHttpRequest.LOADING);
-          this._setReadyState(XMLHttpRequest.DONE);
-
-          this.dispatchEvent({ type: "load", target: this });
-          this.dispatchEvent({ type: "loadend", target: this });
+          setTimeout(poll, 0);
         } catch (_err) {
-          this._setReadyState(XMLHttpRequest.DONE);
-          this.dispatchEvent({ type: "error", target: this });
-          this.dispatchEvent({ type: "loadend", target: this });
+          dropPending();
+          fail("error");
         }
       });
     }

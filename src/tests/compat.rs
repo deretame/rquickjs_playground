@@ -119,3 +119,9 @@ fn compiled_runtime_case_runs() {
     let out = run_case("runtime", serde_json::json!({}), false);
     assert_case_ok(&out);
 }
+
+#[test]
+fn compiled_wasi_case_runs() {
+    let out = run_case("wasi", serde_json::json!({}), false);
+    assert_case_ok(&out);
+}

@@ -83,6 +83,15 @@
       this.headers = new Headers(init.headers || {});
       this.url = init.url || "";
       this.ok = this.status >= 200 && this.status < 300;
+      this.offloaded = Boolean(init.offloaded);
+      this.nativeBufferId = init.nativeBufferId === undefined || init.nativeBufferId === null
+        ? null
+        : Number(init.nativeBufferId);
+      this.offloadedBytes = Number(init.offloadedBytes || 0);
+      this.wasiApplied = Boolean(init.wasiApplied);
+      this.wasiNeedJsProcessing = Boolean(init.wasiNeedJsProcessing);
+      this.wasiFunction = init.wasiFunction || null;
+      this.wasiOutputType = init.wasiOutputType || null;
     }
 
     clone() {
@@ -94,7 +103,31 @@
         statusText: this.statusText,
         headers: this.headers,
         url: this.url,
+        offloaded: this.offloaded,
+        nativeBufferId: this.nativeBufferId,
+        offloadedBytes: this.offloadedBytes,
+        wasiApplied: this.wasiApplied,
+        wasiNeedJsProcessing: this.wasiNeedJsProcessing,
+        wasiFunction: this.wasiFunction,
+        wasiOutputType: this.wasiOutputType,
       });
+    }
+
+    async takeOffloadedBody() {
+      if (this.bodyUsed) {
+        throw new TypeError("Body 已被读取");
+      }
+      this.bodyUsed = true;
+
+      if (!this.offloaded || this.nativeBufferId === null) {
+        return new Uint8Array(0);
+      }
+      if (!globalThis.native || typeof globalThis.native.take !== "function") {
+        throw new TypeError("native.take 不可用，无法读取 offload 二进制数据");
+      }
+      const id = this.nativeBufferId;
+      this.nativeBufferId = null;
+      return globalThis.native.take(id);
     }
 
     static json(data, init = {}) {
@@ -113,37 +146,111 @@
     const request = input instanceof Request ? new Request(input, init) : new Request(input, init);
 
     return new Promise((resolve, reject) => {
+      let requestId = null;
+      let settled = false;
+
+      const finish = (cb) => {
+        if (settled) return;
+        settled = true;
+        cb();
+      };
+
+      const dropPending = () => {
+        if (requestId === null) return;
+        try {
+          globalThis.__http_request_drop(requestId);
+        } catch (_err) {
+        }
+      };
+
       try {
         if (request.signal && request.signal.aborted) {
           const err = new Error(request.signal.reason || "请求已取消");
           err.name = "AbortError";
-          reject(err);
+          finish(() => reject(err));
           return;
         }
 
-        const raw = globalThis.__http_request(
+        const startedRaw = globalThis.__http_request_start(
           request.method,
           request.url,
           JSON.stringify(request.headers.toObject()),
           request._bodyText || null,
         );
-        const payload = JSON.parse(raw);
-
-        if (!payload.ok) {
-          reject(new TypeError(payload.error || "网络请求失败"));
+        const started = JSON.parse(startedRaw);
+        if (!started.ok) {
+          finish(() => reject(new TypeError(started.error || "网络请求失败")));
           return;
         }
+        requestId = Number(started.id);
 
-        resolve(
-          new Response(payload.body || "", {
-            status: payload.status,
-            statusText: payload.statusText,
-            headers: payload.headers || {},
-            url: payload.url || request.url,
-          }),
-        );
+        const onAbort = () => {
+          dropPending();
+          const err = new Error(request.signal.reason || "请求已取消");
+          err.name = "AbortError";
+          finish(() => reject(err));
+        };
+        if (request.signal) {
+          request.signal.addEventListener("abort", onAbort);
+        }
+
+        const poll = () => {
+          if (settled) return;
+          if (request.signal && request.signal.aborted) {
+            onAbort();
+            return;
+          }
+
+          let step;
+          try {
+            step = JSON.parse(globalThis.__http_request_try_take(requestId));
+          } catch (err) {
+            dropPending();
+            finish(() => reject(err));
+            return;
+          }
+
+          if (!step.ok) {
+            dropPending();
+            finish(() => reject(new TypeError(step.error || "网络请求失败")));
+            return;
+          }
+
+          if (!step.done) {
+            setTimeout(poll, 0);
+            return;
+          }
+
+          const payload = JSON.parse(step.result || "{}");
+
+          if (!payload.ok) {
+            finish(() => reject(new TypeError(payload.error || "网络请求失败")));
+            return;
+          }
+
+          finish(() =>
+            resolve(
+              new Response(payload.body || "", {
+                status: payload.status,
+                statusText: payload.statusText,
+                headers: payload.headers || {},
+                url: payload.url || request.url,
+                offloaded: payload.offloaded === true,
+                nativeBufferId: payload.nativeBufferId,
+                offloadedBytes: payload.offloadedBytes,
+                wasiApplied: payload.wasiApplied === true,
+                wasiNeedJsProcessing: payload.wasiNeedJsProcessing === true,
+                wasiFunction: payload.wasiFunction || null,
+                wasiOutputType: payload.wasiOutputType || null,
+              }),
+            ),
+          );
+        };
+
+        setTimeout(poll, 0);
       } catch (err) {
-        reject(err);
+        dropPending();
+        finish(() => reject(err));
       }
     });
   }

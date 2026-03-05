@@ -219,6 +219,124 @@ fn runtime_buffer_basic() {
 }
 
 #[test]
+fn runtime_cache_basic_and_concurrent() {
+    let script = r#"
+      (async () => {
+        cache.clear();
+        cache.set("num", 1);
+        const n1 = cache.get("num");
+        const insertedA = cache.setIfAbsent("lock", { v: 1 });
+        const insertedB = cache.setIfAbsent("lock", { v: 2 });
+        const casFail = cache.compareAndSet("lock", { v: 2 }, { v: 3 });
+        const casOk = cache.compareAndSet("lock", { v: 1 }, { v: 3 });
+        const lockV = cache.get("lock");
+        const hasNum = cache.has("num");
+        const deleted = cache.delete("num");
+        const n2 = cache.get("num", -1);
+
+        const total = 100;
+        await Promise.all(Array.from({ length: total }, (_, i) =>
+          Promise.resolve().then(() => cache.set(`k-${i}`, { i }))
+        ));
+        const values = await Promise.all(Array.from({ length: total }, (_, i) =>
+          Promise.resolve().then(() => cache.get(`k-${i}`))
+        ));
+        const ok = values.every((v, i) => v && v.i === i);
+
+        return JSON.stringify({
+          n1,
+          insertedA,
+          insertedB,
+          casFail,
+          casOk,
+          lockV,
+          hasNum,
+          deleted,
+          n2,
+          count: values.length,
+          ok
+        });
+      })()
+    "#;
+
+    let result = run_async_script(script).expect("执行脚本失败");
+    let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
+
+    assert_eq!(parsed["n1"], 1);
+    assert_eq!(parsed["insertedA"], true);
+    assert_eq!(parsed["insertedB"], false);
+    assert_eq!(parsed["casFail"], false);
+    assert_eq!(parsed["casOk"], true);
+    assert_eq!(parsed["lockV"]["v"], 3);
+    assert_eq!(parsed["hasNum"], true);
+    assert_eq!(parsed["deleted"], true);
+    assert_eq!(parsed["n2"], -1);
+    assert_eq!(parsed["count"], 100);
+    assert_eq!(parsed["ok"], true);
+}
+
+#[test]
+fn runtime_stats_exposed() {
+    let script = r#"
+      (async () => {
+        const raw = globalThis.__runtime_stats();
+        const s = JSON.parse(raw);
+        return JSON.stringify({
+          ok: s.ok === true,
+          hasPending: typeof s.pending === "object",
+          hasLimits: typeof s.limits === "object",
+          hasPermits: typeof s.permits === "object",
+          hasStale: typeof s.staleDrops === "object",
+          hasWasi: typeof s.wasi === "object",
+          hasCap: typeof s.wasi.cacheCapacity === "number"
+        });
+      })()
+    "#;
+
+    let result = run_async_script(script).expect("执行脚本失败");
+    let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
+    assert_eq!(parsed["ok"], true);
+    assert_eq!(parsed["hasPending"], true);
+    assert_eq!(parsed["hasLimits"], true);
+    assert_eq!(parsed["hasPermits"], true);
+    assert_eq!(parsed["hasStale"], true);
+    assert_eq!(parsed["hasWasi"], true);
+    assert_eq!(parsed["hasCap"], true);
+}
+
+#[test]
+fn runtime_console_hook_emits_to_host_logger() {
+    let script = r#"
+      (async () => {
+        const before = JSON.parse(globalThis.__runtime_stats()).logs || {};
+        const beforeEnqueued = Number(before.enqueued || 0);
+
+        console.log("hello", { a: 1 });
+        console.warn("warn-msg");
+        console.error("err-msg");
+
+        await new Promise((r) => setTimeout(r, 0));
+        await new Promise((r) => setTimeout(r, 0));
+
+        const after = JSON.parse(globalThis.__runtime_stats()).logs || {};
+        const deltaEnqueued = Number(after.enqueued || 0) - beforeEnqueued;
+
+        return JSON.stringify({
+          hasConsole: typeof console === "object" && typeof console.log === "function",
+          deltaEnqueued,
+          written: Number(after.written || 0),
+          dropped: Number(after.dropped || 0)
+        });
+      })()
+    "#;
+
+    let result = run_async_script(script).expect("执行脚本失败");
+    let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
+    assert_eq!(parsed["hasConsole"], true);
+    assert!(parsed["deltaEnqueued"].as_i64().unwrap_or(0) >= 3);
+}
+
+#[test]
 fn runtime_runs_compiled_pnpm_bundle() {
     let mut bundle_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     bundle_path.push("pnpm_demo");

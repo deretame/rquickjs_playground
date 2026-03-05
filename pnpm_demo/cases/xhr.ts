@@ -3,7 +3,7 @@
     const cfg = (config || {}) as { baseUrl?: string };
     const baseUrl = String(cfg.baseUrl || "");
     if (!baseUrl || typeof XMLHttpRequest === "undefined") {
-      return { ok: true, skipped: true, reason: "node-no-xhr-or-base-url" };
+      return { ok: false, reason: "xhr-or-base-url-missing" };
     }
 
     const result = await new Promise<{ status: number; text: string }>((resolve, reject) => {

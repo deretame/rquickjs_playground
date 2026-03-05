@@ -11,6 +11,8 @@
     FSError,
     native,
     wasi,
+    cache,
+    console,
     bridge,
     plugin,
     URL,
@@ -31,6 +33,8 @@
   globalThis.FSError = FSError;
   globalThis.native = native;
   globalThis.wasi = wasi;
+  globalThis.cache = cache;
+  globalThis.console = console;
   globalThis.bridge = bridge;
   globalThis.plugin = plugin;
   globalThis.URL = URL;

@@ -1616,9 +1616,7 @@ checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64",
  "bytes",
- "futures-channel",
  "futures-core",
- "futures-util",
  "http",
  "http-body",
  "http-body-util",
@@ -1695,8 +1693,11 @@ dependencies = [
 name = "rquickjs_playground"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "axum",
+ "base64",
  "filetime",
+ "log",
  "reqwest",
  "rquickjs",
  "serde",
@@ -1705,6 +1706,7 @@ dependencies = [
  "tokio",
  "wasmtime",
  "wasmtime-wasi",
+ "wat",
 ]
 
 [[package]]

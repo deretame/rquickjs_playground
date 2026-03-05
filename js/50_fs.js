@@ -502,7 +502,90 @@
     return new FSError(payload.error, payload.code, path);
   }
 
+  const FS_ASYNC_OP_MAP = new Map([
+    [globalThis.__fs_read_file, "readFile"],
+    [globalThis.__fs_write_file, "writeFile"],
+    [globalThis.__fs_mkdir, "mkdir"],
+    [globalThis.__fs_readdir, "readdir"],
+    [globalThis.__fs_stat, "stat"],
+    [globalThis.__fs_lstat, "lstat"],
+    [globalThis.__fs_access, "access"],
+    [globalThis.__fs_unlink, "unlink"],
+    [globalThis.__fs_rm, "rm"],
+    [globalThis.__fs_rename, "rename"],
+    [globalThis.__fs_copy_file, "copyFile"],
+    [globalThis.__fs_cp, "cp"],
+    [globalThis.__fs_realpath, "realpath"],
+    [globalThis.__fs_readlink, "readlink"],
+    [globalThis.__fs_symlink, "symlink"],
+    [globalThis.__fs_link, "link"],
+    [globalThis.__fs_truncate, "truncate"],
+    [globalThis.__fs_chmod, "chmod"],
+    [globalThis.__fs_utimes, "utimes"],
+    [globalThis.__fs_mkdtemp, "mkdtemp"],
+  ]);
+
   function callHost(hostFn, args, path, mapResult) {
+    const op = FS_ASYNC_OP_MAP.get(hostFn);
+    if (op && typeof globalThis.__fs_task_start === "function") {
+      return new Promise((resolve, reject) => {
+        let requestId = null;
+        let settled = false;
+
+        const finish = (fn) => {
+          if (settled) return;
+          settled = true;
+          fn();
+        };
+
+        const poll = () => {
+          if (settled) return;
+          let step;
+          try {
+            step = JSON.parse(globalThis.__fs_task_try_take(requestId));
+          } catch (err) {
+            finish(() => reject(err));
+            return;
+          }
+
+          if (!step.ok) {
+            finish(() => reject(createFSError({ error: step.error, code: "EIO" }, path)));
+            return;
+          }
+
+          if (!step.done) {
+            setTimeout(poll, 0);
+            return;
+          }
+
+          const payload = JSON.parse(step.result || "{}");
+          if (!payload.ok) {
+            finish(() => reject(createFSError(payload, path)));
+            return;
+          }
+          finish(() => resolve(mapResult ? mapResult(payload) : undefined));
+        };
+
+        try {
+          const start = JSON.parse(globalThis.__fs_task_start(op, JSON.stringify(args)));
+          if (!start.ok) {
+            finish(() => reject(createFSError({ error: start.error, code: "EIO" }, path)));
+            return;
+          }
+          requestId = Number(start.id);
+          setTimeout(poll, 0);
+        } catch (err) {
+          if (requestId !== null && typeof globalThis.__fs_task_drop === "function") {
+            try {
+              globalThis.__fs_task_drop(requestId);
+            } catch (_dropErr) {
+            }
+          }
+          finish(() => reject(err));
+        }
+      });
+    }
+
     return Promise.resolve().then(() => {
       const raw = hostFn(...args);
       const payload = JSON.parse(raw);

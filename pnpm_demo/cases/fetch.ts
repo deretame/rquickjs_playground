@@ -3,7 +3,7 @@
     const cfg = (config || {}) as { baseUrl?: string };
     const baseUrl = String(cfg.baseUrl || "");
     if (!baseUrl || typeof fetch !== "function") {
-      return { ok: true, skipped: true, reason: "node-no-base-url-or-fetch" };
+      return { ok: false, reason: "fetch-or-base-url-missing" };
     }
     const res = await fetch(`${baseUrl}/fetch-case`);
     const data = await res.json() as { path?: string; method?: string };

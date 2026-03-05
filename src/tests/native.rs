@@ -1,5 +1,144 @@
 use crate::tests::run_async_script;
 use serde_json::Value;
+use wat::parse_str;
+
+fn wasi_echo_stdin_module_bytes() -> Vec<u8> {
+    parse_str(
+        r#"
+        (module
+          (import "wasi_snapshot_preview1" "fd_read"
+            (func $fd_read (param i32 i32 i32 i32) (result i32)))
+          (import "wasi_snapshot_preview1" "fd_write"
+            (func $fd_write (param i32 i32 i32 i32) (result i32)))
+
+          (memory (export "memory") 1)
+
+          (func (export "_start")
+            ;; iov for stdin read: { ptr: 100, len: 256 }
+            i32.const 0
+            i32.const 100
+            i32.store
+            i32.const 4
+            i32.const 256
+            i32.store
+
+            ;; fd_read(0, &iov, 1, &nread)
+            i32.const 0
+            i32.const 0
+            i32.const 1
+            i32.const 8
+            call $fd_read
+            drop
+
+            ;; iov for stdout write: { ptr: 100, len: nread }
+            i32.const 16
+            i32.const 100
+            i32.store
+            i32.const 20
+            i32.const 8
+            i32.load
+            i32.store
+
+            ;; fd_write(1, &iov, 1, &nwritten)
+            i32.const 1
+            i32.const 16
+            i32.const 1
+            i32.const 24
+            call $fd_write
+            drop
+          )
+        )
+        "#,
+    )
+    .expect("构建 wasi echo 模块失败")
+}
+
+fn wasi_increment_stdin_module_bytes() -> Vec<u8> {
+    parse_str(
+        r#"
+        (module
+          (import "wasi_snapshot_preview1" "fd_read"
+            (func $fd_read (param i32 i32 i32 i32) (result i32)))
+          (import "wasi_snapshot_preview1" "fd_write"
+            (func $fd_write (param i32 i32 i32 i32) (result i32)))
+
+          (memory (export "memory") 1)
+
+          (func (export "_start")
+            (local $i i32)
+            (local $n i32)
+
+            ;; iov for stdin read: { ptr: 100, len: 256 }
+            i32.const 0
+            i32.const 100
+            i32.store
+            i32.const 4
+            i32.const 256
+            i32.store
+
+            ;; fd_read(0, &iov, 1, &nread)
+            i32.const 0
+            i32.const 0
+            i32.const 1
+            i32.const 8
+            call $fd_read
+            drop
+
+            ;; n = nread
+            i32.const 8
+            i32.load
+            local.set $n
+
+            ;; for (i = 0; i < n; i++) mem[100 + i] += 1
+            i32.const 0
+            local.set $i
+            block $done
+              loop $next
+                local.get $i
+                local.get $n
+                i32.ge_u
+                br_if $done
+
+                i32.const 100
+                local.get $i
+                i32.add
+                i32.const 100
+                local.get $i
+                i32.add
+                i32.load8_u
+                i32.const 1
+                i32.add
+                i32.store8
+
+                local.get $i
+                i32.const 1
+                i32.add
+                local.set $i
+                br $next
+              end
+            end
+
+            ;; iov for stdout write: { ptr: 100, len: n }
+            i32.const 16
+            i32.const 100
+            i32.store
+            i32.const 20
+            local.get $n
+            i32.store
+
+            ;; fd_write(1, &iov, 1, &nwritten)
+            i32.const 1
+            i32.const 16
+            i32.const 1
+            i32.const 24
+            call $fd_write
+            drop
+          )
+        )
+        "#,
+    )
+    .expect("构建 wasi increment 模块失败")
+}
 
 #[test]
 fn native_run_invert_min_copy_api() {
@@ -145,6 +284,68 @@ fn wasi_run_reuse_module_id() {
     let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
     assert_eq!(parsed["c1"], 0);
     assert_eq!(parsed["c2"], 0);
+}
+
+#[test]
+fn wasi_run_processes_stdin_to_stdout() {
+    let wasm = wasi_echo_stdin_module_bytes();
+    let wasm_json = serde_json::to_string(&wasm).expect("序列化 wasm 失败");
+
+    let script = format!(
+        r#"
+      (async () => {{
+        const wasm = new Uint8Array({wasm_json});
+        const input = new TextEncoder().encode("hello-wasi-io");
+        const stdinId = await native.put(input);
+        const result = await wasi.run(wasm, {{ stdinId }});
+        const stdout = await wasi.takeStdout(result);
+        const stderr = await wasi.takeStderr(result);
+        const text = new TextDecoder().decode(stdout);
+
+        return JSON.stringify({{
+          exitCode: result.exitCode,
+          text,
+          stderrLen: stderr.length
+        }});
+      }})()
+    "#
+    );
+
+    let result = run_async_script(&script).expect("执行脚本失败");
+    let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
+    assert_eq!(parsed["exitCode"], 0);
+    assert_eq!(parsed["text"], "hello-wasi-io");
+    assert_eq!(parsed["stderrLen"], 0);
+}
+
+#[test]
+fn wasi_run_transforms_stdin_bytes() {
+    let wasm = wasi_increment_stdin_module_bytes();
+    let wasm_json = serde_json::to_string(&wasm).expect("序列化 wasm 失败");
+
+    let script = format!(
+        r#"
+      (async () => {{
+        const wasm = new Uint8Array({wasm_json});
+        const input = new Uint8Array([65, 66, 67, 120]); // A B C x
+        const stdinId = await native.put(input);
+        const result = await wasi.run(wasm, {{ stdinId }});
+        const stdout = await wasi.takeStdout(result);
+        return JSON.stringify({{
+          exitCode: result.exitCode,
+          out: Array.from(stdout)
+        }});
+      }})()
+    "#
+    );
+
+    let result = run_async_script(&script).expect("执行脚本失败");
+    let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
+    assert_eq!(parsed["exitCode"], 0);
+    assert_eq!(parsed["out"][0], 66);
+    assert_eq!(parsed["out"][1], 67);
+    assert_eq!(parsed["out"][2], 68);
+    assert_eq!(parsed["out"][3], 121);
 }
 
 #[test]

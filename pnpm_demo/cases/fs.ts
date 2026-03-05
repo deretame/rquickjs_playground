@@ -13,7 +13,7 @@
       };
     }).fs;
     if (!runtimeFs || !runtimeFs.promises) {
-      return { ok: true, skipped: true, reason: "node-no-runtime-fs" };
+      return { ok: false, reason: "runtime-fs-missing" };
     }
     const file = `${base.replace(/\\/g, "/")}/case.txt`;
 

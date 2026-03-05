@@ -91,6 +91,42 @@ fn fs_binary_read_write() {
 }
 
 #[test]
+fn fs_concurrent_promises_read_write() {
+    let root = unique_temp_dir("concurrent");
+    let root_js = js_path(&root);
+
+    let script = format!(
+        r#"
+      (async () => {{
+        const base = "{root_js}";
+        const total = 100;
+
+        const writes = Array.from({{ length: total }}, (_, i) => {{
+          const p = `${{base}}/f-${{i}}.txt`;
+          return fs.promises.writeFile(p, `v-${{i}}`, "utf8");
+        }});
+        await Promise.all(writes);
+
+        const reads = Array.from({{ length: total }}, (_, i) => {{
+          const p = `${{base}}/f-${{i}}.txt`;
+          return fs.promises.readFile(p, "utf8");
+        }});
+        const out = await Promise.all(reads);
+        const ok = out.every((v, i) => v === `v-${{i}}`);
+        return JSON.stringify({{ ok, count: out.length }});
+      }})()
+    "#
+    );
+
+    let result = run_async_script(&script).expect("执行脚本失败");
+    let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
+    assert_eq!(parsed["ok"], true);
+    assert_eq!(parsed["count"], 100);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn fs_mkdir_readdir_stat() {
     let root = unique_temp_dir("tree");
     let root_js = js_path(&root);
