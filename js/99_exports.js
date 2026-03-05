@@ -1,0 +1,41 @@
+(() => {
+  const {
+    Headers,
+    AbortController,
+    AbortSignal,
+    Request,
+    Response,
+    fetch,
+    XMLHttpRequest,
+    fs,
+    FSError,
+    native,
+    wasi,
+    bridge,
+    plugin,
+    URL,
+    URLSearchParams,
+    TextEncoder,
+    TextDecoder,
+    Buffer,
+  } = globalThis.__web;
+
+  globalThis.Headers = Headers;
+  globalThis.AbortController = AbortController;
+  globalThis.AbortSignal = AbortSignal;
+  globalThis.Request = Request;
+  globalThis.Response = Response;
+  globalThis.fetch = fetch;
+  globalThis.XMLHttpRequest = XMLHttpRequest;
+  globalThis.fs = fs;
+  globalThis.FSError = FSError;
+  globalThis.native = native;
+  globalThis.wasi = wasi;
+  globalThis.bridge = bridge;
+  globalThis.plugin = plugin;
+  globalThis.URL = URL;
+  globalThis.URLSearchParams = URLSearchParams;
+  globalThis.TextEncoder = TextEncoder;
+  globalThis.TextDecoder = TextDecoder;
+  globalThis.Buffer = Buffer;
+})();
