@@ -40,6 +40,10 @@ impl PluginManager {
                 host.eval_async(plugin_bootstrap_script())
                     .expect("初始化插件脚本失败");
 
+                let info = get_plugin_info(&host, "test1", &json!({ "tag": "http-worker-init" }))
+                    .expect("读取插件 getInfo 失败");
+                println!("http worker test1 getInfo: {info}");
+
                 while let Ok(job) = rx.recv() {
                     let _ = job.reply_tx.send(invoke_one(&host, &job.name, &job.function, &job.args));
                 }
@@ -154,30 +158,110 @@ fn invoke_one(host: &HostRuntime, name: &str, function: &str, args: &Value) -> R
     }
 }
 
+fn get_plugin_info(host: &HostRuntime, plugin_name: &str, query: &Value) -> Result<Value, String> {
+    let name_json = serde_json::to_string(plugin_name).map_err(|e| e.to_string())?;
+    let query_json = serde_json::to_string(query).map_err(|e| e.to_string())?;
+    let script = format!(
+        r#"
+        (async () => {{
+          try {{
+            const data = await globalThis.__plugin_get_info({name_json}, {query_json});
+            return JSON.stringify({{ ok: true, data }});
+          }} catch (err) {{
+            return JSON.stringify({{ ok: false, error: String(err && err.message ? err.message : err) }});
+          }}
+        }})()
+        "#
+    );
+
+    let raw = host.eval_async(&script).map_err(|e| e.to_string())?;
+    let payload: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    if payload.get("ok").and_then(Value::as_bool) == Some(true) {
+        Ok(payload.get("data").cloned().unwrap_or(Value::Null))
+    } else {
+        Err(payload
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("调用失败")
+            .to_string())
+    }
+}
+
 fn plugin_bootstrap_script() -> &'static str {
     r#"
     (async () => {
-      const handlers = {
+      const plugins = {
         test1: {
-          "1": async (arg) => ({ doubled: Number(arg) * 2 }),
-          "2": async (arg) => ({ upper: String(arg).toUpperCase() }),
+          getInfo: (query) => ({
+            name: "test1",
+            version: "1.0.0",
+            description: "基础字符串与数字处理插件",
+            apiVersion: 1,
+            author: "demo-team",
+            capabilities: ["transform"],
+            requestTag: query && query.tag ? String(query.tag) : "default"
+          }),
+          handlers: {
+            "1": async (arg) => ({ doubled: Number(arg) * 2 }),
+            "2": async (arg) => ({ upper: String(arg).toUpperCase() }),
+          }
         },
         test2: {
-          "1": async (arg) => ({ len: JSON.stringify(arg).length }),
+          getInfo: () => ({
+            name: "test2",
+            version: "1.0.0",
+            description: "计算输入 JSON 长度",
+            apiVersion: 1,
+            capabilities: ["analyze"]
+          }),
+          handlers: {
+            "1": async (arg) => ({ len: JSON.stringify(arg).length }),
+          }
         }
       };
 
-      plugin.register({ name: "test1", version: "1.0.0", apiVersion: 1 });
-      plugin.register({ name: "test2", version: "1.0.0", apiVersion: 1 });
+      const normalizeInfo = (raw) => {
+        if (!raw || typeof raw !== "object") {
+          throw new TypeError("getInfo 必须返回对象");
+        }
+        const info = {
+          name: String(raw.name || "").trim(),
+          version: String(raw.version || "").trim(),
+          description: String(raw.description || "").trim(),
+          apiVersion: raw.apiVersion === undefined ? 1 : Number(raw.apiVersion),
+          author: raw.author == null ? undefined : String(raw.author),
+          homepage: raw.homepage == null ? undefined : String(raw.homepage),
+          capabilities: Array.isArray(raw.capabilities) ? raw.capabilities.map((x) => String(x)) : undefined,
+          minHostVersion: raw.minHostVersion == null ? undefined : String(raw.minHostVersion),
+        };
+        if (!info.name) throw new TypeError("getInfo.name 不能为空");
+        if (!info.version) throw new TypeError("getInfo.version 不能为空");
+        if (!info.description) throw new TypeError("getInfo.description 不能为空");
+        if (!Number.isInteger(info.apiVersion) || info.apiVersion <= 0) {
+          throw new TypeError("getInfo.apiVersion 必须是正整数");
+        }
+        return info;
+      };
 
       globalThis.__plugin_invoke = async (name, fnId, args) => {
-        const pluginImpl = handlers[name];
+        const key = String(name || "").trim();
+        const pluginImpl = plugins[key];
         if (!pluginImpl) throw new Error(`插件不存在: ${name}`);
-        const fn = pluginImpl[String(fnId)];
+        const fn = pluginImpl.handlers && pluginImpl.handlers[String(fnId)];
         if (typeof fn !== "function") {
           throw new Error(`插件 ${name} 不支持函数 ${fnId}`);
         }
         return fn(args);
+      };
+
+      globalThis.__plugin_get_info = (name, query) => {
+        const key = String(name || "").trim();
+        if (!key) return null;
+        const pluginImpl = plugins[key];
+        if (!pluginImpl || typeof pluginImpl.getInfo !== "function") {
+          throw new Error(`插件 ${key} 必须导出 getInfo()`);
+        }
+        return normalizeInfo(pluginImpl.getInfo(query));
       };
 
       return "ok";

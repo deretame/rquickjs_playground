@@ -370,19 +370,26 @@ cargo run --example http_plugin_pool
 
 - 插件名
 - 版本号
+- 简介
 - API 版本
 
-项目现在内置了一个最小插件注册器（JS 侧 `plugin`）：
+这里更推荐“**不注册**，由 Rust 直接调用插件导出的全局函数”。
 
-- `plugin.register(info)`
-- `plugin.getInfo(name)`
-- `plugin.list()`
+建议插件暴露：
 
-现在可以用 `call_js_global_function`：
+- `globalThis.__plugin_get_info(name, query)`
+
+其中：
+
+- `name`：插件名
+- `query`：Rust 侧传入的指定参数（对象/字符串都可以）
+
+Rust 侧可以用 `call_js_global_function` 直接调用：
 
 ```rust
 use rquickjs::{Context, Runtime};
 use rquickjs_playground::web_runtime::{WEB_POLYFILL, call_js_global_function};
+use serde_json::json;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = Runtime::new()?;
@@ -391,19 +398,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     context.with(|ctx| {
         ctx.eval::<(), _>(WEB_POLYFILL)?;
 
-        // 这里模拟插件导出的全局函数
+        // 这里模拟插件导出的全局函数（不需要 plugin.register）
         ctx.eval::<(), _>(
             r#"
-            globalThis.__plugin_get_info = async () => ({
-              name: "image-tools",
-              version: "1.2.3",
-              apiVersion: 1
-            });
+            const plugins = {
+              "image-tools": {
+                getInfo(query) {
+                  return {
+                    name: "image-tools",
+                    version: "1.2.3",
+                    description: "示例插件",
+                    apiVersion: 1,
+                    tag: query && query.tag ? String(query.tag) : "default"
+                  };
+                }
+              }
+            };
+
+            globalThis.__plugin_get_info = async (name, query) => {
+              const key = String(name || "").trim();
+              if (!key) return null;
+              const p = plugins[key];
+              if (!p || typeof p.getInfo !== "function") {
+                throw new Error(`插件 ${key} 未导出 getInfo`);
+              }
+              return p.getInfo(query);
+            };
             "#,
         )?;
 
-        let info = call_js_global_function(&ctx, "__plugin_get_info".to_string(), None)
-            .expect("调用 __plugin_get_info 失败");
+        let args = json!([
+            "image-tools",
+            { "tag": "from-rust" }
+        ])
+        .to_string();
+
+        let info = call_js_global_function(
+            &ctx,
+            "__plugin_get_info".to_string(),
+            Some(args),
+        )
+        .expect("调用 __plugin_get_info 失败");
 
         println!("plugin info: {}", info);
         Ok::<(), rquickjs::Error>(())
@@ -419,45 +454,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 这样 Rust 会调用 `globalThis[函数名](...args)`，并支持 `async` 函数。
 
-如果你希望宿主侧更简单，可以直接用这三个 Rust helper：
+建议约定每个插件都必须导出 `getInfo()`，至少返回：
 
-- `plugin_load(&ctx, script)`：执行插件脚本（通常脚本内部会调用 `plugin.register(...)`）
-- `plugin_get_info(&ctx, name)`：按名字读单个插件信息
-- `plugin_list(&ctx)`：读取全部插件信息
+- `name: string`
+- `version: string`
+- `description: string`
 
-示例：
+推荐补充字段：
 
-```rust
-use rquickjs::{Context, Runtime};
-use rquickjs_playground::web_runtime::{WEB_POLYFILL, plugin_get_info, plugin_load};
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let runtime = Runtime::new()?;
-    let context = Context::full(&runtime)?;
-
-    context.with(|ctx| {
-        ctx.eval::<(), _>(WEB_POLYFILL)?;
-
-        plugin_load(
-            &ctx,
-            r#"
-            plugin.register({
-              name: "demo-plugin",
-              version: "0.1.0",
-              apiVersion: 1
-            });
-            "#
-            .to_string(),
-        )
-        .expect("加载插件失败");
-
-        let info = plugin_get_info(&ctx, "demo-plugin".to_string())
-            .expect("读取插件信息失败");
-        println!("plugin info: {}", info);
-
-        Ok::<(), rquickjs::Error>(())
-    })?;
-
-    Ok(())
-}
-```
+- `apiVersion: number`（默认可视为 1）
+- `author: string`
+- `homepage: string`
+- `capabilities: string[]`
+- `minHostVersion: string`
