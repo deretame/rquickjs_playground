@@ -27,16 +27,16 @@ pub fn ensure_pnpm_cases_built() {
 
         let output = if cfg!(windows) {
             Command::new("cmd")
-                .args(["/C", "pnpm run build:cases"])
+                .args(["/C", "pnpm run test:cases:node"])
                 .current_dir(&demo_dir)
                 .output()
-                .map_err(|e| format!("执行 pnpm build:cases 失败: {e}"))?
+                .map_err(|e| format!("执行 pnpm test:cases:node 失败: {e}"))?
         } else {
             Command::new("pnpm")
-                .args(["run", "build:cases"])
+                .args(["run", "test:cases:node"])
                 .current_dir(&demo_dir)
                 .output()
-                .map_err(|e| format!("执行 pnpm build:cases 失败: {e}"))?
+                .map_err(|e| format!("执行 pnpm test:cases:node 失败: {e}"))?
         };
 
         if output.status.success() {
@@ -45,7 +45,7 @@ pub fn ensure_pnpm_cases_built() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             Err(format!(
-                "pnpm build:cases 失败\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                "pnpm test:cases:node 失败\nstdout:\n{stdout}\nstderr:\n{stderr}"
             ))
         }
     });

@@ -120,22 +120,294 @@
     return m;
   };
 
-  __web.parseBodyValue = function parseBodyValue(body) {
-    if (body === undefined || body === null) return undefined;
-    if (typeof body === "string") return body;
-    if (typeof body === "number" || typeof body === "boolean") return String(body);
+  function byteViewToBinaryText(view) {
+    let text = "";
+    for (let i = 0; i < view.length; i += 1) text += String.fromCharCode(view[i]);
+    return text;
+  }
+
+  function bytesToBase64(bytes) {
+    return btoaImpl(byteViewToBinaryText(bytes));
+  }
+
+  function normalizeMimeType(input) {
+    if (input === undefined || input === null) return "";
+    return String(input).trim().toLowerCase();
+  }
+
+  function cloneBytes(view) {
+    const out = new Uint8Array(view.length);
+    out.set(view);
+    return out;
+  }
+
+  function concatBytes(chunks, total) {
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      out.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return out;
+  }
+
+  function blobPartToBytes(part) {
+    if (part instanceof Blob) {
+      return cloneBytes(part._bytes);
+    }
+    if (part instanceof ArrayBuffer) {
+      return cloneBytes(new Uint8Array(part));
+    }
+    if (ArrayBuffer.isView(part)) {
+      return cloneBytes(new Uint8Array(part.buffer, part.byteOffset, part.byteLength));
+    }
+    return encodeUtf8(String(part));
+  }
+
+  class Blob {
+    constructor(parts = [], options = {}) {
+      const list = Array.isArray(parts) ? parts : [parts];
+      const chunks = [];
+      let total = 0;
+      for (const part of list) {
+        const bytes = blobPartToBytes(part);
+        chunks.push(bytes);
+        total += bytes.length;
+      }
+      this._bytes = concatBytes(chunks, total);
+      this.type = normalizeMimeType(options && options.type);
+    }
+
+    get size() {
+      return this._bytes.length;
+    }
+
+    arrayBuffer() {
+      const out = cloneBytes(this._bytes);
+      return Promise.resolve(out.buffer);
+    }
+
+    text() {
+      return Promise.resolve(decodeUtf8(this._bytes));
+    }
+
+    slice(start = 0, end = this.size, contentType = "") {
+      const size = this.size;
+      let from = Number(start);
+      let to = Number(end);
+      if (!Number.isFinite(from)) from = 0;
+      if (!Number.isFinite(to)) to = size;
+      if (from < 0) from = Math.max(size + from, 0);
+      if (to < 0) to = Math.max(size + to, 0);
+      from = Math.min(Math.max(from, 0), size);
+      to = Math.min(Math.max(to, 0), size);
+      if (to < from) to = from;
+      const bytes = this._bytes.slice(from, to);
+      return new Blob([bytes], { type: contentType });
+    }
+
+    get [Symbol.toStringTag]() {
+      return "Blob";
+    }
+  }
+
+  class File extends Blob {
+    constructor(parts = [], name = "", options = {}) {
+      super(parts, options);
+      this.name = String(name);
+      const lm = options && options.lastModified;
+      const ts = Number(lm);
+      this.lastModified = Number.isFinite(ts) ? ts : Date.now();
+    }
+
+    get [Symbol.toStringTag]() {
+      return "File";
+    }
+  }
+
+  function normalizeFormDataEntry(value, filename) {
+    if (value instanceof Blob) {
+      let resolvedFilename;
+      if (filename !== undefined) {
+        resolvedFilename = String(filename);
+      } else if (value instanceof File) {
+        resolvedFilename = value.name;
+      } else {
+        resolvedFilename = "blob";
+      }
+      return {
+        value,
+        filename: resolvedFilename,
+      };
+    }
+
+    return {
+      value: String(value),
+      filename: null,
+    };
+  }
+
+  class FormData {
+    constructor(init) {
+      this._entries = [];
+      if (init instanceof FormData) {
+        for (const entry of init._entries) {
+          this._entries.push({ ...entry });
+        }
+      }
+    }
+
+    append(name, value, filename) {
+      const normalized = normalizeFormDataEntry(value, filename);
+      this._entries.push({
+        name: String(name),
+        value: normalized.value,
+        filename: normalized.filename,
+      });
+    }
+
+    set(name, value, filename) {
+      const key = String(name);
+      this.delete(key);
+      this.append(key, value, filename);
+    }
+
+    get(name) {
+      const key = String(name);
+      for (const entry of this._entries) {
+        if (entry.name === key) return entry.value;
+      }
+      return null;
+    }
+
+    getAll(name) {
+      const key = String(name);
+      const out = [];
+      for (const entry of this._entries) {
+        if (entry.name === key) out.push(entry.value);
+      }
+      return out;
+    }
+
+    has(name) {
+      const key = String(name);
+      return this._entries.some((entry) => entry.name === key);
+    }
+
+    delete(name) {
+      const key = String(name);
+      this._entries = this._entries.filter((entry) => entry.name !== key);
+    }
+
+    forEach(callback, thisArg) {
+      for (const entry of this._entries) {
+        callback.call(thisArg, entry.value, entry.name, this);
+      }
+    }
+
+    *entries() {
+      for (const entry of this._entries) {
+        yield [entry.name, entry.value];
+      }
+    }
+
+    *keys() {
+      for (const entry of this._entries) {
+        yield entry.name;
+      }
+    }
+
+    *values() {
+      for (const entry of this._entries) {
+        yield entry.value;
+      }
+    }
+
+    [Symbol.iterator]() {
+      return this.entries();
+    }
+
+    _toHostMultipartPlan() {
+      const entries = this._entries.map((entry) => {
+        if (entry.value instanceof Blob) {
+          return {
+            name: entry.name,
+            kind: "binary",
+            dataB64: bytesToBase64(entry.value._bytes),
+            filename: entry.filename,
+            contentType: entry.value.type || null,
+          };
+        }
+        return {
+          name: entry.name,
+          kind: "text",
+          value: String(entry.value),
+        };
+      });
+
+      return {
+        kind: "rquickjs-formdata-v1",
+        entries,
+      };
+    }
+  }
+
+  __web.FormData = FormData;
+
+  __web.parseBodyInit = function parseBodyInit(body) {
+    if (body === undefined || body === null) {
+      return {
+        bodyText: undefined,
+        contentType: null,
+      };
+    }
+
+    if (body instanceof FormData) {
+      const plan = body._toHostMultipartPlan();
+      return {
+        bodyText: JSON.stringify(plan),
+        contentType: null,
+        hostBodyKind: "formData",
+      };
+    }
+
+    if (typeof URLSearchParams !== "undefined" && body instanceof URLSearchParams) {
+      return {
+        bodyText: body.toString(),
+        contentType: "application/x-www-form-urlencoded;charset=UTF-8",
+      };
+    }
+
+    if (body instanceof Blob) {
+      return {
+        bodyText: byteViewToBinaryText(body._bytes),
+        contentType: body.type || null,
+      };
+    }
+
+    if (typeof body === "string") {
+      return { bodyText: body, contentType: null };
+    }
+    if (typeof body === "number" || typeof body === "boolean") {
+      return { bodyText: String(body), contentType: null };
+    }
     if (body instanceof ArrayBuffer) {
-      const view = new Uint8Array(body);
-      let text = "";
-      for (let i = 0; i < view.length; i += 1) text += String.fromCharCode(view[i]);
-      return text;
+      return {
+        bodyText: byteViewToBinaryText(new Uint8Array(body)),
+        contentType: null,
+      };
     }
     if (ArrayBuffer.isView(body)) {
-      let text = "";
-      for (let i = 0; i < body.byteLength; i += 1) text += String.fromCharCode(body[i]);
-      return text;
+      return {
+        bodyText: byteViewToBinaryText(new Uint8Array(body.buffer, body.byteOffset, body.byteLength)),
+        contentType: null,
+      };
     }
-    return JSON.stringify(body);
+
+    return {
+      bodyText: JSON.stringify(body),
+      contentType: "application/json",
+    };
   };
 
   __web.stringToArrayBuffer = function stringToArrayBuffer(text) {
@@ -282,6 +554,215 @@
     }
   }
 
+  function normalizeEncoding(encoding, defaultEncoding = "utf8") {
+    const enc = String(encoding || defaultEncoding).toLowerCase();
+    if (enc === "utf8" || enc === "utf-8") return "utf8";
+    if (enc === "hex") return "hex";
+    if (enc === "base64") return "base64";
+    if (enc === "latin1" || enc === "binary") return "latin1";
+    if (enc === "buffer") return "buffer";
+    throw new TypeError(`不支持的编码: ${encoding}`);
+  }
+
+  function bytesFromHex(text) {
+    const clean = String(text).replace(/\s+/g, "").toLowerCase();
+    if (clean.length % 2 !== 0) {
+      throw new TypeError("无效的 hex 字符串");
+    }
+    const out = new Uint8Array(clean.length / 2);
+    for (let i = 0; i < out.length; i += 1) {
+      const part = clean.slice(i * 2, i * 2 + 2);
+      const v = Number.parseInt(part, 16);
+      if (Number.isNaN(v)) {
+        throw new TypeError("无效的 hex 字符串");
+      }
+      out[i] = v;
+    }
+    return out;
+  }
+
+  function bytesFromBase64(text) {
+    const raw = atobImpl(String(text));
+    const out = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i += 1) {
+      out[i] = raw.charCodeAt(i) & 0xff;
+    }
+    return out;
+  }
+
+  function bytesFromLatin1(text) {
+    const raw = String(text);
+    const out = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i += 1) {
+      out[i] = raw.charCodeAt(i) & 0xff;
+    }
+    return out;
+  }
+
+  function toBytes(input, encoding = "utf8") {
+    if (typeof input === "string") {
+      const enc = normalizeEncoding(encoding);
+      if (enc === "utf8") return encodeUtf8(input);
+      if (enc === "hex") return bytesFromHex(input);
+      if (enc === "base64") return bytesFromBase64(input);
+      if (enc === "latin1") return bytesFromLatin1(input);
+      throw new TypeError(`不支持的编码: ${encoding}`);
+    }
+
+    if (input instanceof ArrayBuffer) {
+      return new Uint8Array(input.slice(0));
+    }
+    if (ArrayBuffer.isView(input)) {
+      const view = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+      return cloneBytes(view);
+    }
+    if (Array.isArray(input)) {
+      return Uint8Array.from(input);
+    }
+    throw new TypeError("不支持的数据类型");
+  }
+
+  function bytesToHex(bytes) {
+    let out = "";
+    for (let i = 0; i < bytes.length; i += 1) {
+      const b = bytes[i];
+      out += HEX[(b >> 4) & 0x0f] + HEX[b & 0x0f];
+    }
+    return out;
+  }
+
+  function bytesToDigest(bytes, outputEncoding) {
+    if (outputEncoding === undefined || outputEncoding === null) {
+      return Buffer.from(bytes);
+    }
+    const enc = normalizeEncoding(outputEncoding, "hex");
+    if (enc === "buffer") return Buffer.from(bytes);
+    if (enc === "hex") return bytesToHex(bytes);
+    if (enc === "base64") return bytesToBase64(bytes);
+    if (enc === "latin1") return byteViewToBinaryText(bytes);
+    if (enc === "utf8") return decodeUtf8(bytes);
+    throw new TypeError(`不支持的编码: ${outputEncoding}`);
+  }
+
+  function parseHostCryptoResult(raw, actionName) {
+    let parsed;
+    try {
+      parsed = JSON.parse(String(raw || ""));
+    } catch (_err) {
+      throw new TypeError(`crypto host ${actionName} 返回格式无效`);
+    }
+    if (!parsed || parsed.ok !== true) {
+      throw new TypeError(parsed && parsed.error ? parsed.error : `crypto host ${actionName} 执行失败`);
+    }
+    return parsed;
+  }
+
+  function concatChunks(chunks) {
+    const total = chunks.reduce((n, c) => n + c.length, 0);
+    return concatBytes(chunks, total);
+  }
+
+  function normalizeHashAlgorithm(algorithm) {
+    const alg = String(algorithm || "").toLowerCase();
+    if (alg === "sha256" || alg === "sha-256") return "sha256";
+    throw new TypeError(`不支持的 hash 算法: ${algorithm}`);
+  }
+
+  class Hash {
+    constructor(algorithm) {
+      this.algorithm = normalizeHashAlgorithm(algorithm);
+      this._chunks = [];
+      this._digested = false;
+    }
+
+    update(data, inputEncoding) {
+      if (this._digested) {
+        throw new TypeError("digest 后不能再 update");
+      }
+      this._chunks.push(toBytes(data, inputEncoding));
+      return this;
+    }
+
+    digest(outputEncoding) {
+      if (this._digested) {
+        throw new TypeError("digest 只能调用一次");
+      }
+      this._digested = true;
+      const input = concatChunks(this._chunks);
+      const inputB64 = bytesToBase64(input);
+      const out = parseHostCryptoResult(globalThis.__crypto_sha256_b64(inputB64), "sha256");
+      if (outputEncoding === undefined || outputEncoding === null || normalizeEncoding(outputEncoding, "hex") === "buffer") {
+        return Buffer.from(bytesFromBase64(out.base64));
+      }
+      const enc = normalizeEncoding(outputEncoding, "hex");
+      if (enc === "hex") return out.hex;
+      if (enc === "base64") return out.base64;
+      if (enc === "latin1") return byteViewToBinaryText(bytesFromBase64(out.base64));
+      if (enc === "utf8") return decodeUtf8(bytesFromBase64(out.base64));
+      throw new TypeError(`不支持的编码: ${outputEncoding}`);
+    }
+  }
+
+  class Hmac {
+    constructor(algorithm, key) {
+      this.algorithm = normalizeHashAlgorithm(algorithm);
+      this._chunks = [];
+      this._digested = false;
+      this._key = toBytes(key, "utf8");
+    }
+
+    update(data, inputEncoding) {
+      if (this._digested) {
+        throw new TypeError("digest 后不能再 update");
+      }
+      this._chunks.push(toBytes(data, inputEncoding));
+      return this;
+    }
+
+    digest(outputEncoding) {
+      if (this._digested) {
+        throw new TypeError("digest 只能调用一次");
+      }
+      this._digested = true;
+      const message = concatChunks(this._chunks);
+      const keyB64 = bytesToBase64(this._key);
+      const msgB64 = bytesToBase64(message);
+      const out = parseHostCryptoResult(globalThis.__crypto_hmac_sha256_b64(keyB64, msgB64), "hmac-sha256");
+      if (outputEncoding === undefined || outputEncoding === null || normalizeEncoding(outputEncoding, "hex") === "buffer") {
+        return Buffer.from(bytesFromBase64(out.base64));
+      }
+      const enc = normalizeEncoding(outputEncoding, "hex");
+      if (enc === "hex") return out.hex;
+      if (enc === "base64") return out.base64;
+      if (enc === "latin1") return byteViewToBinaryText(bytesFromBase64(out.base64));
+      if (enc === "utf8") return decodeUtf8(bytesFromBase64(out.base64));
+      throw new TypeError(`不支持的编码: ${outputEncoding}`);
+    }
+  }
+
+  function createHash(algorithm) {
+    return new Hash(algorithm);
+  }
+
+  function createHmac(algorithm, key) {
+    return new Hmac(algorithm, key);
+  }
+
+  function randomBytes(size) {
+    const n = Number(size);
+    if (!Number.isInteger(n) || n < 0) {
+      throw new TypeError("size 必须是非负整数");
+    }
+    const out = parseHostCryptoResult(globalThis.__crypto_random_bytes_b64(n), "randomBytes");
+    return Buffer.from(bytesFromBase64(out.base64));
+  }
+
+  const cryptoModule = {
+    createHash,
+    createHmac,
+    randomBytes,
+  };
+
   const BASE64_TABLE = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
   function btoaImpl(input) {
@@ -320,6 +801,33 @@
       if (clean[i + 3] !== "=") out += String.fromCharCode(n & 0xff);
     }
     return out;
+  }
+
+  const HEX = "0123456789abcdef";
+
+  function randomByte() {
+    return Math.floor(Math.random() * 256) & 0xff;
+  }
+
+  function formatUuid(bytes) {
+    let out = "";
+    for (let i = 0; i < bytes.length; i += 1) {
+      if (i === 4 || i === 6 || i === 8 || i === 10) out += "-";
+      const b = bytes[i];
+      out += HEX[(b >> 4) & 0x0f];
+      out += HEX[b & 0x0f];
+    }
+    return out;
+  }
+
+  function uuidv4() {
+    const bytes = new Uint8Array(16);
+    for (let i = 0; i < bytes.length; i += 1) {
+      bytes[i] = randomByte();
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    return formatUuid(bytes);
   }
 
   class URLSearchParams {
@@ -619,18 +1127,29 @@
 
   __web.TextEncoder = TextEncoder;
   __web.TextDecoder = TextDecoder;
+  __web.Blob = Blob;
+  __web.File = File;
   __web.URLSearchParams = URLSearchParams;
   __web.URL = URL;
   __web.path = path;
   __web.Buffer = Buffer;
   __web.bufferModule = { Buffer };
+  __web.crypto = cryptoModule;
+  __web.cryptoModule = cryptoModule;
+  __web.uuidv4 = uuidv4;
+  __web.uuidv4Module = { uuidv4 };
 
   if (!globalThis.TextEncoder) globalThis.TextEncoder = TextEncoder;
   if (!globalThis.TextDecoder) globalThis.TextDecoder = TextDecoder;
+  if (!globalThis.Blob) globalThis.Blob = Blob;
+  if (!globalThis.File) globalThis.File = File;
+  if (!globalThis.FormData) globalThis.FormData = FormData;
   if (!globalThis.URLSearchParams) globalThis.URLSearchParams = URLSearchParams;
   if (!globalThis.URL) globalThis.URL = URL;
   if (!globalThis.path) globalThis.path = path;
   if (!globalThis.Buffer) globalThis.Buffer = Buffer;
+  if (!globalThis.crypto) globalThis.crypto = cryptoModule;
+  if (!globalThis.uuidv4) globalThis.uuidv4 = uuidv4;
   if (!globalThis.btoa) globalThis.btoa = btoaImpl;
   if (!globalThis.atob) globalThis.atob = atobImpl;
 

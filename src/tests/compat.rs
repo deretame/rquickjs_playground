@@ -72,7 +72,7 @@ fn unique_temp_dir() -> PathBuf {
 #[test]
 fn compiled_fetch_case_runs() {
     ensure_pnpm_cases_built();
-    let (base_url, tx, handle) = spawn_test_server(1);
+    let (base_url, tx, handle) = spawn_test_server(4);
     let out = run_case("fetch", serde_json::json!({ "baseUrl": base_url }), false);
     assert_case_ok(&out);
     let _ = tx.send(());
@@ -82,7 +82,7 @@ fn compiled_fetch_case_runs() {
 #[test]
 fn compiled_xhr_case_runs() {
     ensure_pnpm_cases_built();
-    let (base_url, tx, handle) = spawn_test_server(1);
+    let (base_url, tx, handle) = spawn_test_server(4);
     let out = run_case("xhr", serde_json::json!({ "baseUrl": base_url }), false);
     assert_case_ok(&out);
     let _ = tx.send(());
@@ -123,5 +123,17 @@ fn compiled_runtime_case_runs() {
 #[test]
 fn compiled_wasi_case_runs() {
     let out = run_case("wasi", serde_json::json!({}), false);
+    assert_case_ok(&out);
+}
+
+#[test]
+fn compiled_cache_case_runs() {
+    let out = run_case("cache", serde_json::json!({}), false);
+    assert_case_ok(&out);
+}
+
+#[test]
+fn compiled_bridge_case_runs() {
+    let out = run_case("bridge", serde_json::json!({}), false);
     assert_case_ok(&out);
 }

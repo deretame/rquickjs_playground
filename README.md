@@ -179,6 +179,70 @@ cargo test
 
 ---
 
+## 5.1 Host FormData 协议（`rquickjs-formdata-v1`）
+
+为了让 multipart 边界、编码细节完全由 `reqwest` 处理，当前实现采用“JS 结构化描述 -> Rust 组装 multipart”的协议。
+
+### 目的
+
+- 避免在 JS 端手写 multipart 文本与 boundary。
+- 把 multipart 规范细节交给 `reqwest::multipart`。
+- 后续可通过 `kind` 版本化扩展而不破坏已有行为。
+
+### 传输流程
+
+1. JS 端检测到 `body instanceof FormData`。
+2. JS 将 `FormData` 编码为 JSON plan，作为 `body` 传给 host。
+3. 同时追加请求头：`x-rquickjs-host-body-formdata-v1: 1`。
+4. Rust 端识别该头后：
+   - 解析 JSON plan；
+   - 用 `reqwest::multipart::Form` / `Part` 构造请求；
+   - 忽略 JS 侧 `content-type`，由 reqwest 自动生成 `multipart/form-data; boundary=...`。
+
+### Plan 结构
+
+顶层结构：
+
+```json
+{
+  "kind": "rquickjs-formdata-v1",
+  "entries": [
+    {
+      "name": "field1",
+      "kind": "text",
+      "value": "hello"
+    },
+    {
+      "name": "file1",
+      "kind": "binary",
+      "dataB64": "aGVsbG8=",
+      "filename": "a.txt",
+      "contentType": "text/plain"
+    }
+  ]
+}
+```
+
+字段说明：
+
+- `kind`（顶层）
+  - 当前固定 `rquickjs-formdata-v1`。
+- `entries[]`
+  - `name: string` 字段名。
+  - `kind: "text" | "binary"`。
+  - `value?: string`（`text` 必填）。
+  - `dataB64?: string`（`binary` 必填，base64 字节）。
+  - `filename?: string | null`（`binary` 可选）。
+  - `contentType?: string | null`（`binary` 可选）。
+
+### 兼容与约束
+
+- Rust 端如果收到未知顶层 `kind`，会直接报错。
+- 该协议只用于 `FormData`；其他 body（JSON、`URLSearchParams`、`Blob` 等）走原有分支。
+- 建议后续新增字段时保持向后兼容；如有不兼容变更，升级 `kind`（例如 `rquickjs-formdata-v2`）。
+
+---
+
 ## 6. 图片处理实战示例
 
 下面给一个“可直接粘贴到 QuickJS 里执行”的最小示例。

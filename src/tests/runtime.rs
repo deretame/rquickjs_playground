@@ -219,27 +219,129 @@ fn runtime_buffer_basic() {
 }
 
 #[test]
+fn runtime_uuidv4_basic() {
+    let script = r#"
+      (async () => {
+        const mod = require("uuidv4");
+        const fromGlobal = uuidv4();
+        const fromModule = mod.uuidv4();
+        const re = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+        const ids = [];
+        for (let i = 0; i < 64; i += 1) ids.push(uuidv4());
+        const unique = new Set(ids);
+
+        return JSON.stringify({
+          hasGlobal: typeof uuidv4 === "function",
+          hasModuleFn: typeof mod.uuidv4 === "function",
+          globalValid: re.test(fromGlobal),
+          moduleValid: re.test(fromModule),
+          allValid: ids.every((id) => re.test(id)),
+          uniqueAll: unique.size === ids.length
+        });
+      })()
+    "#;
+
+    let result = run_async_script(script).expect("执行脚本失败");
+    let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
+
+    assert_eq!(parsed["hasGlobal"], true);
+    assert_eq!(parsed["hasModuleFn"], true);
+    assert_eq!(parsed["globalValid"], true);
+    assert_eq!(parsed["moduleValid"], true);
+    assert_eq!(parsed["allValid"], true);
+    assert_eq!(parsed["uniqueAll"], true);
+}
+
+#[test]
+fn runtime_crypto_hash_and_hmac_basic() {
+    let script = r#"
+      (async () => {
+        const crypto = require("crypto");
+        const text = "The quick brown fox jumps over the lazy dog";
+
+        const shaHex = crypto.createHash("sha256").update(text).digest("hex");
+        const hmacHex = crypto.createHmac("sha256", "key").update(text).digest("hex");
+        const hmacBase64 = crypto.createHmac("sha256", "key").update(text).digest("base64");
+        const random = crypto.randomBytes(16);
+
+        return JSON.stringify({
+          hasGlobal: typeof globalThis.crypto === "object",
+          hasCreateHash: typeof crypto.createHash === "function",
+          hasCreateHmac: typeof crypto.createHmac === "function",
+          hasRandomBytes: typeof crypto.randomBytes === "function",
+          shaHex,
+          hmacHex,
+          hmacBase64,
+          randomLen: random.length,
+          randomIsBuffer: Buffer.isBuffer(random)
+        });
+      })()
+    "#;
+
+    let result = run_async_script(script).expect("执行脚本失败");
+    let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
+
+    assert_eq!(parsed["hasGlobal"], true);
+    assert_eq!(parsed["hasCreateHash"], true);
+    assert_eq!(parsed["hasCreateHmac"], true);
+    assert_eq!(parsed["hasRandomBytes"], true);
+    assert_eq!(parsed["randomLen"], 16);
+    assert_eq!(parsed["randomIsBuffer"], true);
+    assert_eq!(
+        parsed["shaHex"],
+        "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592"
+    );
+    assert_eq!(
+        parsed["hmacHex"],
+        "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
+    );
+    assert_eq!(
+        parsed["hmacBase64"],
+        "97yD9DBThCSxMpjmqm+xQ+9NWaFJRhdZl0edvC0aPNg="
+    );
+}
+
+#[test]
 fn runtime_cache_basic_and_concurrent() {
     let script = r#"
       (async () => {
-        cache.clear();
-        cache.set("num", 1);
-        const n1 = cache.get("num");
-        const insertedA = cache.setIfAbsent("lock", { v: 1 });
-        const insertedB = cache.setIfAbsent("lock", { v: 2 });
-        const casFail = cache.compareAndSet("lock", { v: 2 }, { v: 3 });
-        const casOk = cache.compareAndSet("lock", { v: 1 }, { v: 3 });
-        const lockV = cache.get("lock");
-        const hasNum = cache.has("num");
-        const deleted = cache.delete("num");
-        const n2 = cache.get("num", -1);
+        const scoped = cache.scoped("runtimeCase");
+        scoped.delete("num");
+        scoped.delete("lock");
+        scoped.clearAll();
+
+        scoped.set("num", 1);
+        const n1 = scoped.get("num");
+        const insertedA = scoped.setIfAbsent("lock", { v: 1 });
+        const insertedB = scoped.setIfAbsent("lock", { v: 2 });
+        const casFail = scoped.compareAndSet("lock", { v: 2 }, { v: 3 });
+        const casOk = scoped.compareAndSet("lock", { v: 1 }, { v: 3 });
+        const lockV = scoped.get("lock");
+        const hasNum = scoped.has("num");
+        const deleted = scoped.delete("num");
+        const n2 = scoped.get("num", -1);
+
+        let keyFormatError = "";
+        try {
+          cache.set("badkey", 1);
+        } catch (err) {
+          keyFormatError = String(err.message || err);
+        }
+        const hasClear = typeof cache.clear === "function";
+
+        scoped.set("tempA", 1);
+        scoped.set("tempB", 2);
+        const cleared = scoped.clearAll();
+        const hasTempA = scoped.has("tempA");
+        const hasTempB = scoped.has("tempB");
 
         const total = 100;
         await Promise.all(Array.from({ length: total }, (_, i) =>
-          Promise.resolve().then(() => cache.set(`k-${i}`, { i }))
+          Promise.resolve().then(() => scoped.set(`k-${i}`, { i }))
         ));
         const values = await Promise.all(Array.from({ length: total }, (_, i) =>
-          Promise.resolve().then(() => cache.get(`k-${i}`))
+          Promise.resolve().then(() => scoped.get(`k-${i}`))
         ));
         const ok = values.every((v, i) => v && v.i === i);
 
@@ -253,6 +355,11 @@ fn runtime_cache_basic_and_concurrent() {
           hasNum,
           deleted,
           n2,
+          hasClear,
+          cleared,
+          hasTempA,
+          hasTempB,
+          keyFormatError,
           count: values.length,
           ok
         });
@@ -271,6 +378,14 @@ fn runtime_cache_basic_and_concurrent() {
     assert_eq!(parsed["hasNum"], true);
     assert_eq!(parsed["deleted"], true);
     assert_eq!(parsed["n2"], -1);
+    assert_eq!(parsed["hasClear"], false);
+    assert!(parsed["cleared"].as_i64().unwrap_or(0) >= 2);
+    assert_eq!(parsed["hasTempA"], false);
+    assert_eq!(parsed["hasTempB"], false);
+    assert!(parsed["keyFormatError"]
+        .as_str()
+        .unwrap_or("")
+        .contains("{pluginPrefix}::{sha256(key)}"));
     assert_eq!(parsed["count"], 100);
     assert_eq!(parsed["ok"], true);
 }

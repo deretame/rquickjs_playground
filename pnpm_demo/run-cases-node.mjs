@@ -5,11 +5,17 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
+import {
+  createHash,
+  createHmac,
+  randomBytes,
+  randomUUID,
+} from "node:crypto";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { tmpdir } from "node:os";
 
-const caseNames = ["fetch", "xhr", "axios", "fs", "native", "runtime", "wasi"];
+const caseNames = ["fetch", "xhr", "axios", "fs", "native", "runtime", "wasi", "cache", "bridge"];
 
 function toUint8Array(input) {
   if (input instanceof Uint8Array) return new Uint8Array(input);
@@ -56,8 +62,15 @@ async function startTestServer() {
   const server = createServer(async (req, res) => {
     const method = String(req.method || "GET");
     const path = String(req.url || "/");
-    req.resume();
-    const payload = JSON.stringify({ method, path });
+    const headers = Object.fromEntries(
+      Object.entries(req.headers).map(([k, v]) => [k.toLowerCase(), Array.isArray(v) ? v.join(",") : String(v ?? "")]),
+    );
+    const bodyChunks = [];
+    for await (const chunk of req) {
+      bodyChunks.push(Buffer.from(chunk));
+    }
+    const body = Buffer.concat(bodyChunks).toString("utf8");
+    const payload = JSON.stringify({ method, path, headers, body });
     res.statusCode = 200;
     res.setHeader("content-type", "application/json");
     res.setHeader("connection", "close");
@@ -228,6 +241,89 @@ function createRuntimeAdapters() {
     },
   };
 
+  const cacheStore = new Map();
+  const cache = {
+    set(key, value) {
+      cacheStore.set(String(key), value);
+      return value;
+    },
+    setIfAbsent(key, value) {
+      const k = String(key);
+      if (cacheStore.has(k)) return false;
+      cacheStore.set(k, value);
+      return true;
+    },
+    compareAndSet(key, expected, value) {
+      const k = String(key);
+      if (!cacheStore.has(k)) return false;
+      const current = cacheStore.get(k);
+      if (JSON.stringify(current) !== JSON.stringify(expected)) return false;
+      cacheStore.set(k, value);
+      return true;
+    },
+    get(key, fallback = null) {
+      const k = String(key);
+      return cacheStore.has(k) ? cacheStore.get(k) : fallback;
+    },
+    has(key) {
+      return cacheStore.has(String(key));
+    },
+    delete(key) {
+      return cacheStore.delete(String(key));
+    },
+    scoped(pluginName) {
+      const ns = String(pluginName || "").trim();
+      if (!ns) throw new TypeError("pluginName 不能为空");
+      if (ns.length > 200) throw new TypeError("pluginName 长度不能超过 200 字符");
+      const prefix = `plg_${createHash("sha256").update(ns, "utf8").digest("hex")}`;
+      const withPrefix = (key) => {
+        const localKey = String(key || "").trim();
+        if (!localKey) throw new TypeError("cache key 不能为空");
+        if (localKey.length > 200) throw new TypeError("cache key 长度不能超过 200 字符");
+        const keyHash = createHash("sha256").update(localKey, "utf8").digest("hex");
+        return `${prefix}::${keyHash}`;
+      };
+      return {
+        set: (key, value) => cache.set(withPrefix(key), value),
+        setIfAbsent: (key, value) => cache.setIfAbsent(withPrefix(key), value),
+        compareAndSet: (key, expected, value) => cache.compareAndSet(withPrefix(key), expected, value),
+        get: (key, fallback = null) => cache.get(withPrefix(key), fallback),
+        has: (key) => cache.has(withPrefix(key)),
+        delete: (key) => cache.delete(withPrefix(key)),
+        clearAll: () => {
+          let deleted = 0;
+          const marker = `${prefix}::`;
+          for (const k of Array.from(cacheStore.keys())) {
+            if (k.startsWith(marker)) {
+              cacheStore.delete(k);
+              deleted += 1;
+            }
+          }
+          return deleted;
+        },
+      };
+    },
+  };
+
+  const bridge = {
+    async call(name, ...args) {
+      const method = String(name || "");
+      if (method === "math.add") {
+        return Number(args[0] || 0) + Number(args[1] || 0);
+      }
+      if (method === "native.put") {
+        return native.put(new Uint8Array(args[0] || []));
+      }
+      if (method === "native.take") {
+        return Array.from(await native.take(Number(args[0])));
+      }
+      if (method === "native.exec") {
+        return native.exec(String(args[0]), Number(args[1]), args[2] ?? null, args[3] ?? null);
+      }
+      throw new Error(`不支持的 bridge 方法: ${method}`);
+    },
+  };
+
   return {
     fs: {
       promises: {
@@ -238,6 +334,14 @@ function createRuntimeAdapters() {
       },
     },
     XMLHttpRequest: createXmlHttpRequest(),
+    cache,
+    bridge,
+    nodeCryptoCompat: {
+      createHash,
+      createHmac,
+      randomBytes,
+    },
+    uuidv4: () => randomUUID().replace(/-/g, ""),
     native,
     wasi,
   };

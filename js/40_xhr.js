@@ -1,5 +1,6 @@
 (() => {
-  const { nextTick, normalizeMethod, parseBodyValue, Headers, stringToArrayBuffer } = globalThis.__web;
+  const HOST_FORMDATA_BODY_HEADER = "x-rquickjs-host-body-formdata-v1";
+  const { nextTick, normalizeMethod, parseBodyInit, Headers, stringToArrayBuffer } = globalThis.__web;
 
   class MiniEventTarget {
     constructor() {
@@ -146,11 +147,18 @@
         };
 
         try {
+          const bodyInit = parseBodyInit(body);
+          if (!this._headers.has("content-type") && bodyInit.contentType) {
+            this._headers.set("content-type", bodyInit.contentType);
+          }
+          if (bodyInit.hostBodyKind === "formData") {
+            this._headers.set(HOST_FORMDATA_BODY_HEADER, "1");
+          }
           const startedRaw = globalThis.__http_request_start(
             this._method,
             this._url,
             JSON.stringify(this._headers.toObject()),
-            parseBodyValue(body) ?? null,
+            bodyInit.bodyText ?? null,
           );
           const started = JSON.parse(startedRaw);
           if (!started.ok) {

@@ -1,11 +1,12 @@
-use serde_json::Map;
-use serde_json::{Value, json};
 use anyhow::{Context as AnyhowContext, Result as AnyResult, anyhow};
 use base64::Engine as Base64Engine;
 use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE as BASE64_URL_SAFE};
 use serde::Deserialize;
+use serde_json::Map;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::env;
 use std::fs;
 use std::io;
 use std::io::Write;
@@ -16,8 +17,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use getrandom::fill as random_fill;
+use hmac::{Hmac, Mac};
 use log::Level;
-use reqwest::{Client, Method};
+use reqwest::multipart::{Form as MultipartForm, Part as MultipartPart};
+use reqwest::{Client, Method, Proxy};
+use sha2::{Digest, Sha256};
 
 use filetime::{FileTime, set_file_times};
 use rquickjs::{Ctx, Promise, function::Func};
@@ -90,9 +95,18 @@ pub fn install_host_bindings(ctx: &Ctx<'_>) -> Result<(), rquickjs::Error> {
     globals.set("__cache_compare_and_set", Func::from(cache_compare_and_set))?;
     globals.set("__cache_get", Func::from(cache_get))?;
     globals.set("__cache_delete", Func::from(cache_delete))?;
-    globals.set("__cache_clear", Func::from(cache_clear))?;
+    globals.set("__cache_clear_prefix", Func::from(cache_clear_prefix))?;
     globals.set("__log_emit", Func::from(log_emit))?;
     globals.set("__runtime_stats", Func::from(runtime_stats))?;
+    globals.set("__crypto_sha256_b64", Func::from(crypto_sha256_b64))?;
+    globals.set(
+        "__crypto_hmac_sha256_b64",
+        Func::from(crypto_hmac_sha256_b64),
+    )?;
+    globals.set(
+        "__crypto_random_bytes_b64",
+        Func::from(crypto_random_bytes_b64),
+    )?;
     globals.set("__fs_read_file", Func::from(fs_read_file))?;
     globals.set("__fs_write_file", Func::from(fs_write_file))?;
     globals.set("__fs_mkdir", Func::from(fs_mkdir))?;
@@ -179,7 +193,8 @@ enum CacheCommand {
         key: String,
         reply_tx: mpsc::Sender<String>,
     },
-    Clear {
+    ClearByPrefix {
+        prefix: String,
         reply_tx: mpsc::Sender<String>,
     },
 }
@@ -224,9 +239,7 @@ fn wasi_linker() -> AnyResult<&'static Linker<wasmtime_wasi::p1::WasiP1Ctx>> {
         .map_err(|e| anyhow!("注册 WASI linker 失败: {e}"))?;
 
     match WASI_LINKER.set(linker) {
-        Ok(()) => Ok(WASI_LINKER
-            .get()
-            .expect("wasi linker 初始化后必须可读取")),
+        Ok(()) => Ok(WASI_LINKER.get().expect("wasi linker 初始化后必须可读取")),
         Err(_linker) => Ok(WASI_LINKER
             .get()
             .expect("wasi linker 并发初始化后必须可读取")),
@@ -238,6 +251,7 @@ const FS_MAX_IN_FLIGHT: usize = 128;
 const WASI_MAX_IN_FLIGHT: usize = 32;
 const HTTP_OFFLOAD_BODY_HEADER: &str = "x-rquickjs-host-offload-binary-v1";
 const HTTP_WASI_TRANSFORM_HEADER: &str = "x-rquickjs-host-wasi-transform-b64-v1";
+const HTTP_FORMDATA_BODY_HEADER: &str = "x-rquickjs-host-body-formdata-v1";
 const HTTP_MAX_PENDING: usize = 4096;
 const FS_MAX_PENDING: usize = 4096;
 const WASI_MAX_PENDING: usize = 1024;
@@ -285,6 +299,148 @@ fn header_truthy(value: &str) -> bool {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct HostFormDataPlan {
+    kind: Option<String>,
+    entries: Vec<HostFormDataEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HostFormDataEntry {
+    name: String,
+    kind: String,
+    value: Option<String>,
+    data_b64: Option<String>,
+    filename: Option<String>,
+    content_type: Option<String>,
+}
+
+fn parse_host_formdata_plan(raw_json: &str) -> AnyResult<HostFormDataPlan> {
+    let plan = serde_json::from_str::<HostFormDataPlan>(raw_json)
+        .context("解析 host formdata plan JSON 失败")?;
+    if let Some(kind) = &plan.kind {
+        if kind != "rquickjs-formdata-v1" {
+            return Err(anyhow!("不支持的 formdata plan kind: {kind}"));
+        }
+    }
+    Ok(plan)
+}
+
+fn decode_host_base64(raw_b64: &str) -> AnyResult<Vec<u8>> {
+    let raw = raw_b64.trim();
+    BASE64_STANDARD
+        .decode(raw)
+        .or_else(|_| BASE64_URL_SAFE.decode(raw))
+        .context("base64 解码 formdata 字段失败")
+}
+
+type HmacSha256 = Hmac<Sha256>;
+
+fn crypto_sha256_b64(input_b64: String) -> String {
+    let result: AnyResult<String> = (|| {
+        let input = decode_host_base64(&input_b64).context("解析 sha256 输入失败")?;
+        let mut hasher = Sha256::new();
+        hasher.update(&input);
+        let out = hasher.finalize();
+        Ok(json!({
+            "ok": true,
+            "hex": format!("{:x}", out),
+            "base64": BASE64_STANDARD.encode(out)
+        })
+        .to_string())
+    })();
+
+    match result {
+        Ok(v) => v,
+        Err(err) => json!({ "ok": false, "error": format!("{err:#}") }).to_string(),
+    }
+}
+
+fn crypto_hmac_sha256_b64(key_b64: String, input_b64: String) -> String {
+    let result: AnyResult<String> = (|| {
+        let key = decode_host_base64(&key_b64).context("解析 hmac key 失败")?;
+        let input = decode_host_base64(&input_b64).context("解析 hmac 输入失败")?;
+        let mut mac = HmacSha256::new_from_slice(&key).context("初始化 hmac 失败")?;
+        mac.update(&input);
+        let out = mac.finalize().into_bytes();
+        Ok(json!({
+            "ok": true,
+            "hex": format!("{:x}", out),
+            "base64": BASE64_STANDARD.encode(out)
+        })
+        .to_string())
+    })();
+
+    match result {
+        Ok(v) => v,
+        Err(err) => json!({ "ok": false, "error": format!("{err:#}") }).to_string(),
+    }
+}
+
+fn crypto_random_bytes_b64(size: i32) -> String {
+    let result: AnyResult<String> = (|| {
+        if size < 0 {
+            return Err(anyhow!("size 必须是非负整数"));
+        }
+        let n = usize::try_from(size).context("size 超出范围")?;
+        let mut bytes = vec![0u8; n];
+        if n > 0 {
+            random_fill(&mut bytes).map_err(|e| anyhow!("生成随机字节失败: {e}"))?;
+        }
+        Ok(json!({
+            "ok": true,
+            "base64": BASE64_STANDARD.encode(bytes)
+        })
+        .to_string())
+    })();
+
+    match result {
+        Ok(v) => v,
+        Err(err) => json!({ "ok": false, "error": format!("{err:#}") }).to_string(),
+    }
+}
+
+fn build_multipart_form(plan: HostFormDataPlan) -> AnyResult<MultipartForm> {
+    let mut form = MultipartForm::new();
+    for entry in plan.entries {
+        if entry.kind.eq_ignore_ascii_case("text") {
+            let value = entry
+                .value
+                .ok_or_else(|| anyhow!("formdata 文本字段缺少 value"))?;
+            form = form.text(entry.name, value);
+            continue;
+        }
+
+        if entry.kind.eq_ignore_ascii_case("binary") {
+            let data_b64 = entry
+                .data_b64
+                .ok_or_else(|| anyhow!("formdata 二进制字段缺少 dataB64"))?;
+            let bytes = decode_host_base64(&data_b64)?;
+            let mut part = MultipartPart::bytes(bytes);
+            if let Some(filename) = entry.filename {
+                part = part.file_name(filename);
+            }
+            if let Some(content_type) = entry
+                .content_type
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+            {
+                part = part
+                    .mime_str(content_type)
+                    .map_err(|e| anyhow!("设置 formdata part Content-Type 失败: {e}"))?;
+            }
+            form = form.part(entry.name, part);
+            continue;
+        }
+
+        return Err(anyhow!("不支持的 formdata 字段类型: {}", entry.kind));
+    }
+    Ok(form)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct WasiTransformPlan {
     module_id: u64,
     function: Option<String>,
@@ -300,7 +456,8 @@ fn parse_wasi_transform_plan(raw_b64: &str) -> AnyResult<WasiTransformPlan> {
         .or_else(|_| BASE64_STANDARD.decode(raw))
         .context("base64 解码 wasi transform plan 失败")?;
     let json_text = String::from_utf8(decoded).context("wasi transform plan 不是有效 UTF-8")?;
-    serde_json::from_str::<WasiTransformPlan>(&json_text).context("解析 wasi transform plan JSON 失败")
+    serde_json::from_str::<WasiTransformPlan>(&json_text)
+        .context("解析 wasi transform plan JSON 失败")
 }
 
 fn build_wasi_argv_json(plan: &WasiTransformPlan) -> AnyResult<Option<String>> {
@@ -316,7 +473,9 @@ fn build_wasi_argv_json(plan: &WasiTransformPlan) -> AnyResult<Option<String>> {
     if argv.is_empty() {
         Ok(None)
     } else {
-        Ok(Some(serde_json::to_string(&argv).context("序列化 wasi argv 失败")?))
+        Ok(Some(
+            serde_json::to_string(&argv).context("序列化 wasi argv 失败")?,
+        ))
     }
 }
 
@@ -359,7 +518,8 @@ async fn run_wasi_transform_once(plan: &WasiTransformPlan, input: Vec<u8>) -> An
         .get("stdoutId")
         .and_then(Value::as_u64)
         .ok_or_else(|| anyhow!("wasi 返回缺少 stdoutId"))?;
-    let out = native_buffer_take_raw(stdout_id).ok_or_else(|| anyhow!("wasi stdout buffer 不存在"))?;
+    let out =
+        native_buffer_take_raw(stdout_id).ok_or_else(|| anyhow!("wasi stdout buffer 不存在"))?;
     Ok(out)
 }
 
@@ -459,9 +619,12 @@ fn cache_sender() -> &'static mpsc::Sender<CacheCommand> {
                             let existed = map.remove(&key).is_some();
                             let _ = reply_tx.send(json!({ "ok": true, "deleted": existed }).to_string());
                         }
-                        CacheCommand::Clear { reply_tx } => {
-                            map.clear();
-                            let _ = reply_tx.send(json!({ "ok": true }).to_string());
+                        CacheCommand::ClearByPrefix { prefix, reply_tx } => {
+                            let before = map.len();
+                            let marker = format!("{prefix}::");
+                            map.retain(|k, _| !k.starts_with(&marker));
+                            let deleted = before.saturating_sub(map.len());
+                            let _ = reply_tx.send(json!({ "ok": true, "deleted": deleted }).to_string());
                         }
                     }
                 }
@@ -514,10 +677,14 @@ fn http_client() -> AnyResult<&'static Client> {
         return Ok(client);
     }
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .context("创建 HTTP client 失败")?;
+    let mut builder = Client::builder().timeout(Duration::from_secs(30));
+    if let Some(proxy_url) = socks5_proxy_from_env() {
+        let proxy = Proxy::all(&proxy_url)
+            .with_context(|| format!("解析 socks5 代理地址失败: {proxy_url}"))?;
+        builder = builder.proxy(proxy);
+    }
+
+    let client = builder.build().context("创建 HTTP client 失败")?;
 
     match HTTP_CLIENT.set(client) {
         Ok(()) => Ok(HTTP_CLIENT.get().expect("HTTP client 初始化后必须可读取")),
@@ -525,6 +692,27 @@ fn http_client() -> AnyResult<&'static Client> {
             .get()
             .expect("HTTP client 并发初始化后必须可读取")),
     }
+}
+
+fn socks5_proxy_from_env() -> Option<String> {
+    for key in [
+        "RQUICKJS_SOCKS5_PROXY",
+        "SOCKS5_PROXY",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        if let Ok(raw) = env::var(key) {
+            let value = raw.trim();
+            if value.is_empty() {
+                continue;
+            }
+            if value.contains("://") {
+                return Some(value.to_string());
+            }
+            return Some(format!("socks5h://{value}"));
+        }
+    }
+    None
 }
 
 pub fn http_request_start(
@@ -549,11 +737,13 @@ pub fn http_request_start(
         let permit = match timeout(Duration::from_secs(15), sem.acquire_owned()).await {
             Ok(Ok(permit)) => permit,
             Ok(Err(_)) => {
-                let _ = tx.send(json!({ "ok": false, "error": "http 并发控制器不可用" }).to_string());
+                let _ =
+                    tx.send(json!({ "ok": false, "error": "http 并发控制器不可用" }).to_string());
                 return;
             }
             Err(_) => {
-                let _ = tx.send(json!({ "ok": false, "error": "http 等待并发许可超时" }).to_string());
+                let _ =
+                    tx.send(json!({ "ok": false, "error": "http 等待并发许可超时" }).to_string());
                 return;
             }
         };
@@ -848,6 +1038,9 @@ fn fs_task_dispatch(op: String, args_json: String) -> String {
 }
 
 pub fn cache_set(key: String, value_json: String) -> String {
+    if let Err(err) = validate_cache_key(&key) {
+        return json!({ "ok": false, "error": format!("{err:#}") }).to_string();
+    }
     let (reply_tx, reply_rx) = mpsc::channel::<String>();
     if let Err(e) = cache_sender().send(CacheCommand::Set {
         key,
@@ -865,6 +1058,9 @@ pub fn cache_set(key: String, value_json: String) -> String {
 }
 
 pub fn cache_set_if_absent(key: String, value_json: String) -> String {
+    if let Err(err) = validate_cache_key(&key) {
+        return json!({ "ok": false, "error": format!("{err:#}") }).to_string();
+    }
     let (reply_tx, reply_rx) = mpsc::channel::<String>();
     if let Err(e) = cache_sender().send(CacheCommand::SetIfAbsent {
         key,
@@ -882,6 +1078,9 @@ pub fn cache_set_if_absent(key: String, value_json: String) -> String {
 }
 
 pub fn cache_compare_and_set(key: String, expected_json: String, value_json: String) -> String {
+    if let Err(err) = validate_cache_key(&key) {
+        return json!({ "ok": false, "error": format!("{err:#}") }).to_string();
+    }
     let (reply_tx, reply_rx) = mpsc::channel::<String>();
     if let Err(e) = cache_sender().send(CacheCommand::CompareAndSet {
         key,
@@ -900,6 +1099,9 @@ pub fn cache_compare_and_set(key: String, expected_json: String, value_json: Str
 }
 
 pub fn cache_get(key: String) -> String {
+    if let Err(err) = validate_cache_key(&key) {
+        return json!({ "ok": false, "error": format!("{err:#}") }).to_string();
+    }
     let (reply_tx, reply_rx) = mpsc::channel::<String>();
     if let Err(e) = cache_sender().send(CacheCommand::Get { key, reply_tx }) {
         return json!({ "ok": false, "error": format!("cache worker 不可用: {e}") }).to_string();
@@ -913,6 +1115,9 @@ pub fn cache_get(key: String) -> String {
 }
 
 pub fn cache_delete(key: String) -> String {
+    if let Err(err) = validate_cache_key(&key) {
+        return json!({ "ok": false, "error": format!("{err:#}") }).to_string();
+    }
     let (reply_tx, reply_rx) = mpsc::channel::<String>();
     if let Err(e) = cache_sender().send(CacheCommand::Delete { key, reply_tx }) {
         return json!({ "ok": false, "error": format!("cache worker 不可用: {e}") }).to_string();
@@ -925,9 +1130,12 @@ pub fn cache_delete(key: String) -> String {
     }
 }
 
-pub fn cache_clear() -> String {
+pub fn cache_clear_prefix(prefix: String) -> String {
+    if let Err(err) = validate_cache_prefix(&prefix) {
+        return json!({ "ok": false, "error": format!("{err:#}") }).to_string();
+    }
     let (reply_tx, reply_rx) = mpsc::channel::<String>();
-    if let Err(e) = cache_sender().send(CacheCommand::Clear { reply_tx }) {
+    if let Err(e) = cache_sender().send(CacheCommand::ClearByPrefix { prefix, reply_tx }) {
         return json!({ "ok": false, "error": format!("cache worker 不可用: {e}") }).to_string();
     }
     match reply_rx.recv() {
@@ -936,6 +1144,42 @@ pub fn cache_clear() -> String {
             json!({ "ok": false, "error": format!("cache worker 响应失败: {e}") }).to_string()
         }
     }
+}
+
+fn validate_cache_key(key: &str) -> AnyResult<()> {
+    let raw = key.trim();
+    if raw.is_empty() {
+        return Err(anyhow!("cache key 不能为空"));
+    }
+    let Some((prefix, hashed_key)) = raw.split_once("::") else {
+        return Err(anyhow!("cache key 必须为 {{pluginPrefix}}::{{sha256(key)}} 格式"));
+    };
+    if prefix.is_empty() || hashed_key.is_empty() {
+        return Err(anyhow!("cache key 必须为 {{pluginPrefix}}::{{sha256(key)}} 格式"));
+    }
+    validate_cache_prefix(prefix)?;
+    if hashed_key.len() != 64 || !hashed_key.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(anyhow!("cache key 哈希段必须是 64 位十六进制 sha256"));
+    }
+    Ok(())
+}
+
+fn validate_cache_prefix(prefix: &str) -> AnyResult<()> {
+    let raw = prefix.trim();
+    if raw.is_empty() {
+        return Err(anyhow!("cache 前缀不能为空"));
+    }
+    if raw.chars().count() > 200 {
+        return Err(anyhow!("cache key 前缀长度不能超过 200 字符"));
+    }
+    if !raw.starts_with("plg_") {
+        return Err(anyhow!("cache 前缀必须以 plg_ 开头"));
+    }
+    let digest = &raw[4..];
+    if digest.len() != 64 || !digest.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(anyhow!("cache 前缀哈希段必须是 64 位十六进制 sha256"));
+    }
+    Ok(())
 }
 
 pub fn log_emit(level: String, message: String) -> String {
@@ -974,10 +1218,7 @@ pub fn log_emit(level: String, message: String) -> String {
 }
 
 pub fn runtime_stats() -> String {
-    let mut http_pending = http_req_pool()
-        .lock()
-        .map(|m| m.len())
-        .unwrap_or_default();
+    let mut http_pending = http_req_pool().lock().map(|m| m.len()).unwrap_or_default();
     let mut fs_pending = fs_req_pool().lock().map(|m| m.len()).unwrap_or_default();
     let mut wasi_pending = wasi_req_pool().lock().map(|m| m.len()).unwrap_or_default();
 
@@ -1063,6 +1304,8 @@ async fn http_request_inner_async(
     let client = http_client()?;
     let mut offload_body_to_native = false;
     let mut wasi_transform_plan: Option<WasiTransformPlan> = None;
+    let mut formdata_body = false;
+    let mut plain_headers: Vec<(String, String)> = Vec::new();
 
     let mut builder = client.request(method, &url);
 
@@ -1077,9 +1320,20 @@ async fn http_request_inner_async(
                     wasi_transform_plan = Some(parse_wasi_transform_plan(v)?);
                     continue;
                 }
-                builder = builder.header(&key, v);
+                if key.eq_ignore_ascii_case(HTTP_FORMDATA_BODY_HEADER) {
+                    formdata_body = header_truthy(v);
+                    continue;
+                }
+                plain_headers.push((key, v.to_string()));
             }
         }
+    }
+
+    for (key, value) in plain_headers {
+        if formdata_body && key.eq_ignore_ascii_case("content-type") {
+            continue;
+        }
+        builder = builder.header(&key, value);
     }
 
     if wasi_transform_plan.is_some() && !offload_body_to_native {
@@ -1088,7 +1342,12 @@ async fn http_request_inner_async(
         ));
     }
 
-    if let Some(content) = body {
+    if formdata_body {
+        let raw_plan = body.ok_or_else(|| anyhow!("formdata 请求缺少 body payload"))?;
+        let plan = parse_host_formdata_plan(&raw_plan)?;
+        let form = build_multipart_form(plan)?;
+        builder = builder.multipart(form);
+    } else if let Some(content) = body {
         builder = builder.body(content);
     }
 
@@ -1097,10 +1356,7 @@ async fn http_request_inner_async(
     let final_url = response.url().to_string();
 
     for (name, value) in response.headers() {
-        let value_text = value
-            .to_str()
-            .context("解析 HTTP 响应头失败")?
-            .to_string();
+        let value_text = value.to_str().context("解析 HTTP 响应头失败")?.to_string();
         headers_map.insert(name.to_string(), Value::String(value_text));
     }
 
@@ -1400,7 +1656,9 @@ const WASI_MODULE_CACHE_MAX_ENTRIES: usize = 64;
 
 fn wasi_module_get_or_compile(wasm_bytes: &[u8]) -> AnyResult<Module> {
     {
-        let cache = wasi_module_cache().lock().expect("wasi module cache 加锁失败");
+        let cache = wasi_module_cache()
+            .lock()
+            .expect("wasi module cache 加锁失败");
         if let Some(module) = cache.get(wasm_bytes) {
             WASI_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
             return Ok(module.clone());
@@ -1410,12 +1668,13 @@ fn wasi_module_get_or_compile(wasm_bytes: &[u8]) -> AnyResult<Module> {
     WASI_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
 
     let engine = wasi_engine();
-    let module =
-        Module::new(engine, wasm_bytes).map_err(|e| anyhow!("编译 WASM 模块失败: {e}"))?;
+    let module = Module::new(engine, wasm_bytes).map_err(|e| anyhow!("编译 WASM 模块失败: {e}"))?;
 
     {
         let key = wasm_bytes.to_vec();
-        let mut cache = wasi_module_cache().lock().expect("wasi module cache 加锁失败");
+        let mut cache = wasi_module_cache()
+            .lock()
+            .expect("wasi module cache 加锁失败");
         if let Some(existing) = cache.get(wasm_bytes) {
             return Ok(existing.clone());
         }
@@ -1565,11 +1824,13 @@ pub fn wasi_run_start(
         let permit = match timeout(Duration::from_secs(15), sem.acquire_owned()).await {
             Ok(Ok(permit)) => permit,
             Ok(Err(_)) => {
-                let _ = tx.send(json!({ "ok": false, "error": "wasi 并发控制器不可用" }).to_string());
+                let _ =
+                    tx.send(json!({ "ok": false, "error": "wasi 并发控制器不可用" }).to_string());
                 return;
             }
             Err(_) => {
-                let _ = tx.send(json!({ "ok": false, "error": "wasi 等待并发许可超时" }).to_string());
+                let _ =
+                    tx.send(json!({ "ok": false, "error": "wasi 等待并发许可超时" }).to_string());
                 return;
             }
         };
@@ -1906,7 +2167,10 @@ pub fn fs_write_file(
 ) -> String {
     let bytes = match parse_fs_write_payload(data_json, encoding) {
         Ok(bytes) => bytes,
-        Err(error) => return json!({ "ok": false, "code": "EINVAL", "error": format!("{error}") }).to_string(),
+        Err(error) => {
+            return json!({ "ok": false, "code": "EINVAL", "error": format!("{error}") })
+                .to_string();
+        }
     };
 
     let result = if append {

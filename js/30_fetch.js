@@ -1,6 +1,8 @@
 (() => {
+  const HOST_FORMDATA_BODY_HEADER = "x-rquickjs-host-body-formdata-v1";
+
   const {
-    parseBodyValue,
+    parseBodyInit,
     stringToArrayBuffer,
     normalizeMethod,
     Headers,
@@ -61,14 +63,17 @@
       this.keepalive = Boolean(init.keepalive);
       this.cache = init.cache || "default";
 
-      const bodyValue = parseBodyValue(init.body);
-      if (bodyValue !== undefined) {
+      const bodyInit = parseBodyInit(init.body);
+      if (bodyInit.bodyText !== undefined) {
         if (this.method === "GET" || this.method === "HEAD") {
           throw new TypeError("GET/HEAD 请求不能带 body");
         }
-        this._initBody(bodyValue);
-        if (!this.headers.has("content-type") && typeof init.body === "object") {
-          this.headers.set("content-type", "application/json");
+        this._initBody(bodyInit.bodyText);
+        if (!this.headers.has("content-type") && bodyInit.contentType) {
+          this.headers.set("content-type", bodyInit.contentType);
+        }
+        if (bodyInit.hostBodyKind === "formData") {
+          this.headers.set(HOST_FORMDATA_BODY_HEADER, "1");
         }
       }
     }

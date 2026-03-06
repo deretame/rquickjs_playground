@@ -29,13 +29,32 @@ interface CacheApi {
   get<T = unknown>(key: string, fallback?: T): T | unknown;
   has(key: string): boolean;
   delete(key: string): boolean;
-  clear(): void;
+  scoped(pluginName: string): Omit<CacheApi, "scoped"> & { clearAll(): number };
+}
+
+interface BridgeApi {
+  call(name: string, ...args: unknown[]): Promise<unknown>;
+}
+
+interface CryptoHash {
+  update(data: string | ArrayBuffer | ArrayBufferView, inputEncoding?: "utf8" | "utf-8" | "hex" | "base64" | "latin1" | "binary"): CryptoHash;
+  digest(encoding?: "hex" | "base64" | "latin1" | "binary" | "utf8" | "utf-8" | "buffer"): string | Buffer;
+}
+
+interface CryptoApi {
+  createHash(algorithm: "sha256" | "sha-256"): CryptoHash;
+  createHmac(algorithm: "sha256" | "sha-256", key: string | ArrayBuffer | ArrayBufferView): CryptoHash;
+  randomBytes(size: number): Buffer;
 }
 
 declare global {
   var native: NativeApi | undefined;
   var wasi: WasiApi | undefined;
   var cache: CacheApi | undefined;
+  var bridge: BridgeApi | undefined;
+  var crypto: CryptoApi | undefined;
+  var nodeCryptoCompat: CryptoApi | undefined;
+  var uuidv4: (() => string) | undefined;
   var __caseMain: ((config?: unknown) => Promise<unknown>) | undefined;
   var __demoMain: (() => Promise<unknown>) | undefined;
 }

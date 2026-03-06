@@ -112,6 +112,138 @@ fn fetch_post_json_body() {
 }
 
 #[test]
+fn fetch_post_formdata_body() {
+    let (base_url, tx, handle) = spawn_test_server(2);
+    let script = format!(
+        r#"
+          (async () => {{
+            const fd = new FormData();
+            fd.append("name", "quickjs");
+            fd.append("lang", "rust");
+            const res = await fetch("{}/echo", {{
+              method: "POST",
+              body: fd
+            }});
+            const data = await res.json();
+            return JSON.stringify({{
+              method: data.method,
+              body: data.body,
+              contentType: data.headers["content-type"] || ""
+            }});
+          }})()
+        "#,
+        base_url
+    );
+
+    let result = run_async_script(&script).expect("执行脚本失败");
+    let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
+
+    assert_eq!(parsed["method"], "POST");
+    assert!(parsed["contentType"]
+        .as_str()
+        .unwrap_or("")
+        .contains("multipart/form-data; boundary="));
+    assert!(parsed["body"]
+        .as_str()
+        .unwrap_or("")
+        .contains("name=\"name\""));
+    assert!(parsed["body"].as_str().unwrap_or("").contains("quickjs"));
+    assert!(parsed["body"]
+        .as_str()
+        .unwrap_or("")
+        .contains("name=\"lang\""));
+    assert!(parsed["body"].as_str().unwrap_or("").contains("rust"));
+
+    let _ = tx.send(());
+    let _ = handle.join();
+}
+
+#[test]
+fn fetch_post_formdata_file_fields() {
+    let (base_url, tx, handle) = spawn_test_server(2);
+    let script = format!(
+        r#"
+          (async () => {{
+            const fd = new FormData();
+            const file = new File(["hello-file"], "greeting.txt", {{ type: "text/plain" }});
+            const blob = new Blob(["hello-blob"], {{ type: "application/custom" }});
+            fd.append("upload", file);
+            fd.append("raw", blob, "raw.bin");
+            const res = await fetch("{}/echo", {{
+              method: "POST",
+              body: fd
+            }});
+            const data = await res.json();
+            return JSON.stringify({{
+              method: data.method,
+              body: data.body,
+              contentType: data.headers["content-type"] || ""
+            }});
+          }})()
+        "#,
+        base_url
+    );
+
+    let result = run_async_script(&script).expect("执行脚本失败");
+    let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
+
+    assert_eq!(parsed["method"], "POST");
+    assert!(parsed["contentType"]
+        .as_str()
+        .unwrap_or("")
+        .contains("multipart/form-data; boundary="));
+
+    let body = parsed["body"].as_str().unwrap_or("");
+    assert!(body.contains("name=\"upload\"; filename=\"greeting.txt\""));
+    assert!(body.contains("name=\"raw\"; filename=\"raw.bin\""));
+    assert!(body.contains("Content-Type: text/plain"));
+    assert!(body.contains("Content-Type: application/custom"));
+    assert!(body.contains("hello-file"));
+    assert!(body.contains("hello-blob"));
+
+    let _ = tx.send(());
+    let _ = handle.join();
+}
+
+#[test]
+fn fetch_post_urlsearchparams_body() {
+    let (base_url, tx, handle) = spawn_test_server(2);
+    let script = format!(
+        r#"
+          (async () => {{
+            const params = new URLSearchParams();
+            params.append("name", "quickjs");
+            params.append("lang", "rust");
+            const res = await fetch("{}/echo", {{
+              method: "POST",
+              body: params
+            }});
+            const data = await res.json();
+            return JSON.stringify({{
+              method: data.method,
+              body: data.body,
+              contentType: data.headers["content-type"] || ""
+            }});
+          }})()
+        "#,
+        base_url
+    );
+
+    let result = run_async_script(&script).expect("执行脚本失败");
+    let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
+
+    assert_eq!(parsed["method"], "POST");
+    assert_eq!(parsed["body"], "name=quickjs&lang=rust");
+    assert_eq!(
+        parsed["contentType"],
+        "application/x-www-form-urlencoded;charset=UTF-8"
+    );
+
+    let _ = tx.send(());
+    let _ = handle.join();
+}
+
+#[test]
 fn fetch_headers() {
     let (base_url, tx, handle) = spawn_test_server(2);
     let script = format!(

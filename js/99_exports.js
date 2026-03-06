@@ -17,6 +17,11 @@
     plugin,
     URL,
     URLSearchParams,
+    Blob,
+    File,
+    FormData,
+    crypto,
+    uuidv4,
     TextEncoder,
     TextDecoder,
     Buffer,
@@ -39,6 +44,11 @@
   globalThis.plugin = plugin;
   globalThis.URL = URL;
   globalThis.URLSearchParams = URLSearchParams;
+  globalThis.Blob = Blob;
+  globalThis.File = File;
+  globalThis.FormData = FormData;
+  globalThis.crypto = crypto;
+  globalThis.uuidv4 = uuidv4;
   globalThis.TextEncoder = TextEncoder;
   globalThis.TextDecoder = TextDecoder;
   globalThis.Buffer = Buffer;

@@ -929,6 +929,8 @@
       if (name === "fs/promises") return promises;
       if (name === "path") return globalThis.__web.path;
       if (name === "buffer") return globalThis.__web.bufferModule;
+      if (name === "crypto") return globalThis.__web.cryptoModule;
+      if (name === "uuidv4") return globalThis.__web.uuidv4Module;
       throw new Error(`Cannot find module '${name}'`);
     };
   }
