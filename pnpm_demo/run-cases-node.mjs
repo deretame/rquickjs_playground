@@ -15,7 +15,7 @@ import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { tmpdir } from "node:os";
 
-const caseNames = ["fetch", "xhr", "axios", "fs", "native", "runtime", "wasi", "cache", "bridge"];
+const caseNames = ["fetch", "xhr", "axios", "fs", "native", "runtime", "runtime_api", "wasi", "cache", "bridge"];
 
 function toUint8Array(input) {
   if (input instanceof Uint8Array) return new Uint8Array(input);
@@ -347,6 +347,23 @@ function createRuntimeAdapters() {
   };
 }
 
+function loadCaseEntry(code) {
+  const module = { exports: {} };
+  const exports = module.exports;
+  const requireFn = typeof require === "function" ? require : undefined;
+  const runner = new Function("module", "exports", "require", code);
+  runner(module, exports, requireFn);
+
+  let entry = module.exports;
+  if (entry && typeof entry === "object" && "default" in entry) {
+    entry = entry.default;
+  }
+  if (typeof entry !== "function") {
+    throw new Error("case bundle 必须导出默认函数");
+  }
+  return entry;
+}
+
 Object.assign(globalThis, createRuntimeAdapters());
 
 const baseDir = await mkdtemp(resolve(tmpdir(), "rquickjs-node-case-"));
@@ -356,13 +373,9 @@ try {
   for (const name of caseNames) {
     const file = resolve("dist/cases", `${name}.js`);
     const code = await readFile(file, "utf8");
-    globalThis.__caseMain = undefined;
-    eval(code);
-    if (typeof globalThis.__caseMain !== "function") {
-      throw new Error(`case ${name} 未导出 __caseMain`);
-    }
+    const entry = loadCaseEntry(code);
     const out = await Promise.race([
-      globalThis.__caseMain({ baseDir, baseUrl: server.baseUrl }),
+      entry({ baseDir, baseUrl: server.baseUrl }),
       new Promise((_, reject) => setTimeout(() => reject(new Error(`case ${name} 执行超时`)), 8000)),
     ]);
     if (!out || out.ok !== true) {

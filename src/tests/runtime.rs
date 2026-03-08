@@ -1,6 +1,6 @@
 use crate::tests::run_async_script;
 use crate::web_runtime::{
-    call_js_global_function, plugin_get_info, plugin_list, plugin_load, WEB_POLYFILL,
+    plugin_call, plugin_get_info, plugin_list, plugin_load_bundle, WEB_POLYFILL,
 };
 use rquickjs::{Context, Runtime};
 use serde_json::Value;
@@ -456,7 +456,7 @@ fn runtime_runs_compiled_pnpm_bundle() {
     let mut bundle_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     bundle_path.push("pnpm_demo");
     bundle_path.push("dist");
-    bundle_path.push("bundle.js");
+    bundle_path.push("bundle.cjs");
 
     let bundle =
         fs::read_to_string(&bundle_path).expect("读取编译产物失败，请先执行 pnpm_demo/pnpm build");
@@ -466,8 +466,21 @@ fn runtime_runs_compiled_pnpm_bundle() {
         r#"
       (async () => {{
         const code = {bundle_json};
-        eval(code);
-        const result = await globalThis.__demoMain();
+        const module = {{ exports: {{}} }};
+        const exports = module.exports;
+        const requireFn = typeof require === "function" ? require.bind(globalThis) : undefined;
+        const runner = new Function("module", "exports", "require", code);
+        runner(module, exports, requireFn);
+
+        let entry = module.exports;
+        if (entry && typeof entry === "object" && entry.default !== undefined) {{
+          entry = entry.default;
+        }}
+        if (typeof entry !== "function") {{
+          throw new Error("bundle 必须导出默认函数");
+        }}
+
+        const result = await entry();
         return JSON.stringify(result);
       }})()
     "#
@@ -486,33 +499,43 @@ fn runtime_runs_compiled_pnpm_bundle() {
 }
 
 #[test]
-fn rust_can_call_js_plugin_info_function() {
+fn rust_can_call_js_bundle_export_functions() {
     let runtime = Runtime::new().expect("创建 runtime 失败");
     let context = Context::full(&runtime).expect("创建 context 失败");
 
     context
         .with(|ctx| {
             ctx.eval::<(), _>(WEB_POLYFILL)?;
-            ctx.eval::<(), _>(
-                r#"
-                globalThis.__plugin_get_info = async () => ({
-                  name: "image-tools",
-                  version: "1.2.3",
-                  apiVersion: 1
-                });
-
-                globalThis.__plugin_echo = (name, version) => ({ name, version });
-                "#,
-            )?;
-
-            let info = call_js_global_function(&ctx, "__plugin_get_info".to_string(), None)
-                .expect("调用 __plugin_get_info 失败");
-            let echoed = call_js_global_function(
+            plugin_load_bundle(
                 &ctx,
-                "__plugin_echo".to_string(),
+                "image-tools".to_string(),
+                r#"
+                module.exports = {
+                  async getInfo() {
+                    return {
+                      name: "image-tools",
+                      version: "1.2.3",
+                      apiVersion: 1
+                    };
+                  },
+                  echo(name, version) {
+                    return { name, version };
+                  }
+                };
+                "#
+                .to_string(),
+            )
+            .expect("加载插件 bundle 失败");
+
+            let info = plugin_call(&ctx, "image-tools".to_string(), "getInfo".to_string(), None)
+                .expect("调用 getInfo 失败");
+            let echoed = plugin_call(
+                &ctx,
+                "image-tools".to_string(),
+                "echo".to_string(),
                 Some("[\"demo\",\"0.0.1\"]".to_string()),
             )
-            .expect("调用 __plugin_echo 失败");
+            .expect("调用 echo 失败");
 
             assert_eq!(info["name"], "image-tools");
             assert_eq!(info["version"], "1.2.3");
@@ -534,15 +557,20 @@ fn plugin_helpers_load_and_get_info() {
         .with(|ctx| {
             ctx.eval::<(), _>(WEB_POLYFILL)?;
 
-            plugin_load(
+            plugin_load_bundle(
                 &ctx,
+                "demo-plugin".to_string(),
                 r#"
-                plugin.register({
-                  name: "demo-plugin",
-                  version: "0.1.0",
-                  apiVersion: 1,
-                  description: "demo"
-                });
+                module.exports = {
+                  getInfo() {
+                    return {
+                      name: "demo-plugin",
+                      version: "0.1.0",
+                      apiVersion: 1,
+                      description: "demo"
+                    };
+                  }
+                };
                 "#
                 .to_string(),
             )

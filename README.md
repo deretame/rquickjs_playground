@@ -364,32 +364,35 @@ cargo run --example http_plugin_pool
 
 ---
 
-## 8. Rust 调 JS（插件元信息场景）
+## 8. Rust 调 JS（插件导出函数）
 
-如果你要做插件系统，常见需求是“Rust 宿主主动调用 JS 插件函数拿信息”，比如：
+现在支持“插件 bundle 导出对象 + Rust 按函数名调用”的模式，不再要求插件把函数挂到 `globalThis`。
 
-- 插件名
-- 版本号
-- 简介
-- API 版本
+推荐插件产物（CJS bundle）导出一个对象：
 
-这里更推荐“**不注册**，由 Rust 直接调用插件导出的全局函数”。
+```js
+module.exports = {
+  async getInfo() {
+    return {
+      name: "image-tools",
+      version: "1.2.3",
+      apiVersion: 1,
+      description: "示例插件"
+    };
+  },
+  async run(input) {
+    return { ok: true, input };
+  }
+};
+```
 
-建议插件暴露：
-
-- `globalThis.__plugin_get_info(name, query)`
-
-其中：
-
-- `name`：插件名
-- `query`：Rust 侧传入的指定参数（对象/字符串都可以）
-
-Rust 侧可以用 `call_js_global_function` 直接调用：
+Rust 侧用法：
 
 ```rust
 use rquickjs::{Context, Runtime};
-use rquickjs_playground::web_runtime::{WEB_POLYFILL, call_js_global_function};
-use serde_json::json;
+use rquickjs_playground::web_runtime::{
+    WEB_POLYFILL, plugin_call, plugin_get_info, plugin_load_bundle,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = Runtime::new()?;
@@ -398,72 +401,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     context.with(|ctx| {
         ctx.eval::<(), _>(WEB_POLYFILL)?;
 
-        // 这里模拟插件导出的全局函数（不需要 plugin.register）
-        ctx.eval::<(), _>(
+        plugin_load_bundle(
+            &ctx,
+            "image-tools".to_string(),
             r#"
-            const plugins = {
-              "image-tools": {
-                getInfo(query) {
-                  return {
-                    name: "image-tools",
-                    version: "1.2.3",
-                    description: "示例插件",
-                    apiVersion: 1,
-                    tag: query && query.tag ? String(query.tag) : "default"
-                  };
-                }
+            module.exports = {
+              getInfo() {
+                return { name: "image-tools", version: "1.2.3", apiVersion: 1 };
+              },
+              echo(name, version) {
+                return { name, version };
               }
             };
-
-            globalThis.__plugin_get_info = async (name, query) => {
-              const key = String(name || "").trim();
-              if (!key) return null;
-              const p = plugins[key];
-              if (!p || typeof p.getInfo !== "function") {
-                throw new Error(`插件 ${key} 未导出 getInfo`);
-              }
-              return p.getInfo(query);
-            };
-            "#,
+            "#
+            .to_string(),
         )?;
 
-        let args = json!([
-            "image-tools",
-            { "tag": "from-rust" }
-        ])
-        .to_string();
-
-        let info = call_js_global_function(
+        let info = plugin_get_info(&ctx, "image-tools".to_string())?;
+        let echoed = plugin_call(
             &ctx,
-            "__plugin_get_info".to_string(),
-            Some(args),
-        )
-        .expect("调用 __plugin_get_info 失败");
+            "image-tools".to_string(),
+            "echo".to_string(),
+            Some("[\"demo\",\"0.0.1\"]".to_string()),
+        )?;
 
-        println!("plugin info: {}", info);
-        Ok::<(), rquickjs::Error>(())
+        println!("info={info} echoed={echoed}");
+        Ok::<(), anyhow::Error>(())
     })?;
 
     Ok(())
 }
 ```
 
-如果函数带参数，第三个参数传 JSON 数组字符串，比如：
+备注：当前加载器按 CJS 方式执行 bundle（`module.exports` / `exports.default`），如果你在 TS 中使用 `import/export`，请先打包成单文件 CJS 再交给宿主加载。
 
-- `Some("[\"demo\",\"0.0.1\"]".to_string())`
+---
 
-这样 Rust 会调用 `globalThis[函数名](...args)`，并支持 `async` 函数。
+## 9. TS 侧统一运行时 API（避免重复 `globalThis as ...`）
 
-建议约定每个插件都必须导出 `getInfo()`，至少返回：
+新增了 `pnpm_demo/src/runtime-api.ts`，提供统一类型化入口，插件代码可以直接 import 使用。
 
-- `name: string`
-- `version: string`
-- `description: string`
+示例：
 
-推荐补充字段：
+```ts
+import { requireApi, requireCryptoLike, runtime } from "../src/runtime-api";
 
-- `apiVersion: number`（默认可视为 1）
-- `author: string`
-- `homepage: string`
-- `capabilities: string[]`
-- `minHostVersion: string`
+const crypto = requireCryptoLike();
+const sign = crypto.createHmac("sha256", "key").update("text").digest("hex");
+
+const native = requireApi("native");
+const out = await native.chain(["invert"], new Uint8Array([1, 2, 3]));
+
+const id = runtime.uuidv4();
+```
+
+可用能力包括（按需读取）：
+
+- Web API：`fetch`、`Request`、`Response`、`Headers`、`XMLHttpRequest`、`FormData`、`Blob`、`URL` 等
+- Host API：`fs`、`native`、`wasi`、`cache`、`bridge`、`plugin`
+- Runtime API：`crypto/nodeCryptoCompat`、`uuidv4`、`Buffer`、`TextEncoder/TextDecoder`
+
+并且提供了 `getApi(name)`（可选）与 `requireApi(name)`（缺失直接抛错）两套调用方式。

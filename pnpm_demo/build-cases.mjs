@@ -1,7 +1,7 @@
 import { build } from "esbuild";
 import { mkdir, rm } from "node:fs/promises";
 
-const caseNames = ["fetch", "xhr", "axios", "fs", "native", "runtime", "wasi", "cache", "bridge"];
+const caseNames = ["fetch", "xhr", "axios", "fs", "native", "runtime", "runtime_api", "wasi", "cache", "bridge"];
 
 await rm("dist/cases", { recursive: true, force: true });
 await mkdir("dist/cases", { recursive: true });
@@ -13,7 +13,7 @@ for (const name of caseNames) {
     bundle: true,
     packages: "bundle",
     platform: "browser",
-    format: "iife",
+    format: "cjs",
     target: "es2020",
     treeShaking: true,
     legalComments: "none",

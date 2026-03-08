@@ -1,5 +1,51 @@
 (() => {
   const HOST_FORMDATA_BODY_HEADER = "x-rquickjs-host-body-formdata-v1";
+  const EVENTED_HTTP_PENDING = new Map();
+  const prevHttpComplete = globalThis.__host_runtime_http_complete;
+
+  globalThis.__host_runtime_http_complete = function __host_runtime_http_complete(requestId, payloadRaw) {
+    const pending = EVENTED_HTTP_PENDING.get(Number(requestId));
+    if (!pending) {
+      if (typeof prevHttpComplete === "function") prevHttpComplete(requestId, payloadRaw);
+      return;
+    }
+    EVENTED_HTTP_PENDING.delete(Number(requestId));
+
+    const { request, resolve, reject, finish, dropPending } = pending;
+
+    let payload;
+    try {
+      payload = JSON.parse(String(payloadRaw || "{}"));
+    } catch (err) {
+      dropPending();
+      finish(() => reject(err));
+      return;
+    }
+
+    if (!payload.ok) {
+      dropPending();
+      finish(() => reject(new TypeError(payload.error || "网络请求失败")));
+      return;
+    }
+
+    finish(() =>
+      resolve(
+        new Response(payload.body || "", {
+          status: payload.status,
+          statusText: payload.statusText,
+          headers: payload.headers || {},
+          url: payload.url || request.url,
+          offloaded: payload.offloaded === true,
+          nativeBufferId: payload.nativeBufferId,
+          offloadedBytes: payload.offloadedBytes,
+          wasiApplied: payload.wasiApplied === true,
+          wasiNeedJsProcessing: payload.wasiNeedJsProcessing === true,
+          wasiFunction: payload.wasiFunction || null,
+          wasiOutputType: payload.wasiOutputType || null,
+        }),
+      ),
+    );
+  };
 
   const {
     parseBodyInit,
@@ -163,7 +209,7 @@
       const dropPending = () => {
         if (requestId === null) return;
         try {
-          globalThis.__http_request_drop(requestId);
+          globalThis.__http_request_drop_evented(requestId);
         } catch (_err) {
         }
       };
@@ -176,7 +222,7 @@
           return;
         }
 
-        const startedRaw = globalThis.__http_request_start(
+        const startedRaw = globalThis.__http_request_start_evented(
           request.method,
           request.url,
           JSON.stringify(request.headers.toObject()),
@@ -190,6 +236,7 @@
         requestId = Number(started.id);
 
         const onAbort = () => {
+          EVENTED_HTTP_PENDING.delete(requestId);
           dropPending();
           const err = new Error(request.signal.reason || "请求已取消");
           err.name = "AbortError";
@@ -199,60 +246,13 @@
           request.signal.addEventListener("abort", onAbort);
         }
 
-        const poll = () => {
-          if (settled) return;
-          if (request.signal && request.signal.aborted) {
-            onAbort();
-            return;
-          }
-
-          let step;
-          try {
-            step = JSON.parse(globalThis.__http_request_try_take(requestId));
-          } catch (err) {
-            dropPending();
-            finish(() => reject(err));
-            return;
-          }
-
-          if (!step.ok) {
-            dropPending();
-            finish(() => reject(new TypeError(step.error || "网络请求失败")));
-            return;
-          }
-
-          if (!step.done) {
-            setTimeout(poll, 0);
-            return;
-          }
-
-          const payload = JSON.parse(step.result || "{}");
-
-          if (!payload.ok) {
-            finish(() => reject(new TypeError(payload.error || "网络请求失败")));
-            return;
-          }
-
-          finish(() =>
-            resolve(
-              new Response(payload.body || "", {
-                status: payload.status,
-                statusText: payload.statusText,
-                headers: payload.headers || {},
-                url: payload.url || request.url,
-                offloaded: payload.offloaded === true,
-                nativeBufferId: payload.nativeBufferId,
-                offloadedBytes: payload.offloadedBytes,
-                wasiApplied: payload.wasiApplied === true,
-                wasiNeedJsProcessing: payload.wasiNeedJsProcessing === true,
-                wasiFunction: payload.wasiFunction || null,
-                wasiOutputType: payload.wasiOutputType || null,
-              }),
-            ),
-          );
-        };
-
-        setTimeout(poll, 0);
+        EVENTED_HTTP_PENDING.set(requestId, {
+          request,
+          resolve,
+          reject,
+          finish,
+          dropPending,
+        });
       } catch (err) {
         dropPending();
         finish(() => reject(err));

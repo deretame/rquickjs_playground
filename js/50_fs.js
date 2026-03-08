@@ -1,5 +1,26 @@
 (() => {
   const { stringToArrayBuffer } = globalThis.__web;
+  const EVENTED_FS_PENDING = new Map();
+
+  globalThis.__host_runtime_fs_complete = function __host_runtime_fs_complete(requestId, payloadRaw) {
+    const pending = EVENTED_FS_PENDING.get(Number(requestId));
+    if (!pending) return;
+    EVENTED_FS_PENDING.delete(Number(requestId));
+
+    const { resolve, reject, finish, mapResult, path } = pending;
+    let payload;
+    try {
+      payload = JSON.parse(String(payloadRaw || "{}"));
+    } catch (err) {
+      finish(() => reject(err));
+      return;
+    }
+    if (!payload.ok) {
+      finish(() => reject(createFSError(payload, path)));
+      return;
+    }
+    finish(() => resolve(mapResult ? mapResult(payload) : undefined));
+  };
 
   class MiniEmitter {
     constructor() {
@@ -527,7 +548,7 @@
 
   function callHost(hostFn, args, path, mapResult) {
     const op = FS_ASYNC_OP_MAP.get(hostFn);
-    if (op && typeof globalThis.__fs_task_start === "function") {
+    if (op && typeof globalThis.__fs_task_start_evented === "function") {
       return new Promise((resolve, reject) => {
         let requestId = null;
         let settled = false;
@@ -538,46 +559,24 @@
           fn();
         };
 
-        const poll = () => {
-          if (settled) return;
-          let step;
-          try {
-            step = JSON.parse(globalThis.__fs_task_try_take(requestId));
-          } catch (err) {
-            finish(() => reject(err));
-            return;
-          }
-
-          if (!step.ok) {
-            finish(() => reject(createFSError({ error: step.error, code: "EIO" }, path)));
-            return;
-          }
-
-          if (!step.done) {
-            setTimeout(poll, 0);
-            return;
-          }
-
-          const payload = JSON.parse(step.result || "{}");
-          if (!payload.ok) {
-            finish(() => reject(createFSError(payload, path)));
-            return;
-          }
-          finish(() => resolve(mapResult ? mapResult(payload) : undefined));
-        };
-
         try {
-          const start = JSON.parse(globalThis.__fs_task_start(op, JSON.stringify(args)));
+          const start = JSON.parse(globalThis.__fs_task_start_evented(op, JSON.stringify(args)));
           if (!start.ok) {
             finish(() => reject(createFSError({ error: start.error, code: "EIO" }, path)));
             return;
           }
           requestId = Number(start.id);
-          setTimeout(poll, 0);
+          EVENTED_FS_PENDING.set(requestId, {
+            resolve,
+            reject,
+            finish,
+            mapResult,
+            path,
+          });
         } catch (err) {
-          if (requestId !== null && typeof globalThis.__fs_task_drop === "function") {
+          if (requestId !== null && typeof globalThis.__fs_task_drop_evented === "function") {
             try {
-              globalThis.__fs_task_drop(requestId);
+              globalThis.__fs_task_drop_evented(requestId);
             } catch (_dropErr) {
             }
           }

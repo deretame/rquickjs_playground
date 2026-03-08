@@ -1,4 +1,6 @@
 (() => {
+  const EVENTED_WASI_PENDING = new Map();
+
   function parseHost(raw) {
     const payload = JSON.parse(raw);
     if (!payload.ok) {
@@ -6,6 +8,24 @@
     }
     return payload;
   }
+
+  globalThis.__host_runtime_wasi_complete = function __host_runtime_wasi_complete(requestId, payloadRaw) {
+    const pending = EVENTED_WASI_PENDING.get(Number(requestId));
+    if (!pending) return;
+    EVENTED_WASI_PENDING.delete(Number(requestId));
+
+    const { resolve, reject } = pending;
+    try {
+      const res = parseHost(String(payloadRaw || "{}"));
+      resolve({
+        exitCode: Number(res.exitCode || 0),
+        stdoutId: Number(res.stdoutId),
+        stderrId: Number(res.stderrId),
+      });
+    } catch (err) {
+      reject(err);
+    }
+  };
 
   async function runById(moduleId, options = {}) {
     const stdinId = options.stdinId === undefined || options.stdinId === null
@@ -16,45 +36,16 @@
     return new Promise((resolve, reject) => {
       let requestId = null;
 
-      const poll = () => {
-        let step;
-        try {
-          step = JSON.parse(globalThis.__wasi_run_try_take(requestId));
-        } catch (err) {
-          reject(err);
-          return;
-        }
-
-        if (!step.ok) {
-          reject(new Error(step.error || "wasi 调用失败"));
-          return;
-        }
-
-        if (!step.done) {
-          setTimeout(poll, 0);
-          return;
-        }
-
-        try {
-          const res = parseHost(step.result || "{}");
-          resolve({
-            exitCode: Number(res.exitCode || 0),
-            stdoutId: Number(res.stdoutId),
-            stderrId: Number(res.stderrId),
-          });
-        } catch (err) {
-          reject(err);
-        }
-      };
-
       try {
-        const started = parseHost(globalThis.__wasi_run_start(Number(moduleId), stdinId, argsJson, consumeModule));
+        const started = parseHost(
+          globalThis.__wasi_run_start_evented(Number(moduleId), stdinId, argsJson, consumeModule),
+        );
         requestId = Number(started.id);
-        setTimeout(poll, 0);
+        EVENTED_WASI_PENDING.set(requestId, { resolve, reject });
       } catch (err) {
         if (requestId !== null) {
           try {
-            globalThis.__wasi_run_drop(requestId);
+            globalThis.__wasi_run_drop_evented(requestId);
           } catch (_dropErr) {
           }
         }

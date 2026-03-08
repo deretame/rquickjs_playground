@@ -4,6 +4,7 @@ pub mod fetch;
 pub mod fs;
 pub mod native;
 pub mod runtime;
+pub mod task_runtime;
 pub mod xhr;
 
 pub use crate::web_runtime::{run_async_script, run_async_script_with_axios};

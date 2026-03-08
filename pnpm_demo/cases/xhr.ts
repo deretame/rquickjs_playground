@@ -1,10 +1,9 @@
-(() => {
-  async function main(config: unknown = {}) {
-    const cfg = (config || {}) as { baseUrl?: string };
-    const baseUrl = String(cfg.baseUrl || "");
-    if (!baseUrl || typeof XMLHttpRequest === "undefined") {
-      return { ok: false, reason: "xhr-or-base-url-missing" };
-    }
+export default async function main(config: unknown = {}) {
+  const cfg = (config || {}) as { baseUrl?: string };
+  const baseUrl = String(cfg.baseUrl || "");
+  if (!baseUrl || typeof XMLHttpRequest === "undefined") {
+    return { ok: false, reason: "xhr-or-base-url-missing" };
+  }
 
     const result = await new Promise<{ status: number; text: string }>((resolve, reject) => {
       const xhr = new XMLHttpRequest();
@@ -48,21 +47,19 @@
       headers?: Record<string, string>;
     };
 
-    return {
-      ok:
-        result.status === 200
-        && data.path === "/xhr-case"
-        && data.method === "GET"
-        && urlRes.status === 200
-        && urlData.method === "POST"
-        && urlData.body === "name=quickjs&lang=rust"
-        && String(urlData.headers?.["content-type"] || "")
-          .includes("application/x-www-form-urlencoded;charset=UTF-8")
-        && formRes.status === 200
-        && formData.method === "POST"
-        && String(formData.headers?.["content-type"] || "").includes("multipart/form-data;")
-        && String(formData.body || "").includes("name=\"upload\"; filename=\"a.txt\""),
-    };
-  }
-  globalThis.__caseMain = main as (config?: unknown) => Promise<unknown>;
-})();
+  return {
+    ok:
+      result.status === 200
+      && data.path === "/xhr-case"
+      && data.method === "GET"
+      && urlRes.status === 200
+      && urlData.method === "POST"
+      && urlData.body === "name=quickjs&lang=rust"
+      && String(urlData.headers?.["content-type"] || "")
+        .includes("application/x-www-form-urlencoded;charset=UTF-8")
+      && formRes.status === 200
+      && formData.method === "POST"
+      && String(formData.headers?.["content-type"] || "").includes("multipart/form-data;")
+      && String(formData.body || "").includes("name=\"upload\"; filename=\"a.txt\""),
+  };
+}

@@ -27,8 +27,21 @@ fn run_case(name: &str, config: Value, with_axios: bool) -> Value {
         try {{
           const code = {bundle_json};
           const cfg = {config_json};
-          eval(code);
-          const out = await globalThis.__caseMain(cfg);
+          const module = {{ exports: {{}} }};
+          const exports = module.exports;
+          const requireFn = typeof require === "function" ? require.bind(globalThis) : undefined;
+          const runner = new Function("module", "exports", "require", code);
+          runner(module, exports, requireFn);
+
+          let entry = module.exports;
+          if (entry && typeof entry === "object" && entry.default !== undefined) {{
+            entry = entry.default;
+          }}
+          if (typeof entry !== "function") {{
+            throw new Error("case bundle 必须导出默认函数");
+          }}
+
+          const out = await entry(cfg);
           return JSON.stringify(out);
         }} catch (err) {{
           return JSON.stringify({{
@@ -118,6 +131,22 @@ fn compiled_native_case_runs() {
 fn compiled_runtime_case_runs() {
     let out = run_case("runtime", serde_json::json!({}), false);
     assert_case_ok(&out);
+}
+
+#[test]
+fn compiled_runtime_api_case_runs() {
+    let (base_url, tx, handle) = spawn_test_server(2);
+    let dir = unique_temp_dir();
+    let base_dir = dir.to_string_lossy().replace('\\', "/");
+    let out = run_case(
+        "runtime_api",
+        serde_json::json!({ "baseDir": base_dir, "baseUrl": base_url }),
+        false,
+    );
+    assert_case_ok(&out);
+    let _ = tx.send(());
+    let _ = handle.join();
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]

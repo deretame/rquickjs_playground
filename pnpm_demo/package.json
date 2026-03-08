@@ -2,13 +2,13 @@
   "name": "pnpm_demo",
   "version": "1.0.0",
   "description": "",
-  "main": "dist/bundle.js",
+  "main": "dist/bundle.cjs",
   "type": "module",
   "scripts": {
     "typecheck": "pnpm exec tsc --noEmit",
-    "build": "pnpm run typecheck && pnpm exec esbuild src/index.ts --bundle --platform=browser --format=iife --global-name=DemoApp --outfile=dist/bundle.js",
+    "build": "pnpm run typecheck && pnpm exec esbuild src/index.ts --bundle --platform=browser --format=cjs --outfile=dist/bundle.cjs",
     "build:cases": "node build-cases.mjs",
-    "run:node": "node dist/bundle.js",
+    "run:node": "node dist/bundle.cjs",
     "test:cases:node": "pnpm run build:cases && node run-cases-node.mjs"
   },
   "keywords": [],

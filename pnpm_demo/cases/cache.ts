@@ -1,10 +1,13 @@
-(() => {
-  async function main() {
-    if (!globalThis.cache) {
-      return { ok: false, reason: "cache-missing" };
-    }
+import { getApi, requireApi } from "../src/runtime-api";
 
-    const pluginCache = cache.scoped("caseCache");
+export default async function main() {
+  const maybeCache = getApi("cache");
+  if (!maybeCache) {
+    return { ok: false, reason: "cache-missing" };
+  }
+
+  const cache = requireApi("cache");
+  const pluginCache = cache.scoped("caseCache");
 
     const numKey = "num";
     const lockKey = "lock";
@@ -29,23 +32,20 @@
     const hasTempA = pluginCache.has("tempA");
     const hasTempB = pluginCache.has("tempB");
 
-    return {
-      ok:
-        n1 === 1
-        && insertedA === true
-        && insertedB === false
-        && casFail === false
-        && casOk === true
-        && lockV.v === 3
-        && hasNum === true
-        && deleted === true
-        && n2 === -1
-        && hasClear === false
-        && cleared >= 2
-        && hasTempA === false
-        && hasTempB === false,
-    };
-  }
-
-  globalThis.__caseMain = main as (config?: unknown) => Promise<unknown>;
-})();
+  return {
+    ok:
+      n1 === 1
+      && insertedA === true
+      && insertedB === false
+      && casFail === false
+      && casOk === true
+      && lockV.v === 3
+      && hasNum === true
+      && deleted === true
+      && n2 === -1
+      && hasClear === false
+      && cleared >= 2
+      && hasTempA === false
+      && hasTempB === false,
+  };
+}

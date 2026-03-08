@@ -1,60 +1,104 @@
 export {};
 
-type NativeChainStep = string | { op: string; extraInputId?: number };
+export type NativeChainStep = string | { op: string; extraInputId?: number };
 
-interface NativeApi {
+export interface FsApi {
+  promises: {
+    readFile(path: string, encoding?: string | null): Promise<Uint8Array | string>;
+    writeFile(path: string, data: string | ArrayBuffer | ArrayBufferView | Uint8Array): Promise<void>;
+    appendFile(path: string, data: string | ArrayBuffer | ArrayBufferView | Uint8Array): Promise<void>;
+    mkdir(path: string, options?: { recursive?: boolean }): Promise<void>;
+    readdir(path: string, options?: { withFileTypes?: boolean }): Promise<unknown[]>;
+    stat(path: string): Promise<unknown>;
+    rm(path: string, options?: { recursive?: boolean; force?: boolean }): Promise<void>;
+  };
+}
+
+export interface PathApi {
+  join(...parts: string[]): string;
+  resolve(...parts: string[]): string;
+  dirname(path: string): string;
+  basename(path: string, suffix?: string): string;
+  extname(path: string): string;
+  isAbsolute(path: string): boolean;
+}
+
+export interface NativeApi {
   chain(steps: NativeChainStep[], input: Uint8Array | number): Promise<Uint8Array>;
   run(op: string, input: Uint8Array, args?: unknown, extraInput?: Uint8Array | number): Promise<Uint8Array>;
   put(input: Uint8Array): Promise<number>;
   free(id: number): Promise<void>;
 }
 
-interface WasiRunResult {
+export interface WasiRunResult {
   exitCode: number;
   stdoutId: number;
   stderrId: number;
 }
 
-interface WasiApi {
+export interface WasiApi {
   run(moduleBytes: Uint8Array, options?: { stdinId?: number; args?: string[]; reuseModule?: boolean }): Promise<WasiRunResult>;
   runById(moduleId: number, options?: { stdinId?: number; args?: string[]; reuseModule?: boolean }): Promise<WasiRunResult>;
   takeStdout(result: WasiRunResult): Promise<Uint8Array>;
   takeStderr(result: WasiRunResult): Promise<Uint8Array>;
 }
 
-interface CacheApi {
+export interface CacheApi {
   set(key: string, value: unknown): unknown;
   setIfAbsent(key: string, value: unknown): boolean;
   compareAndSet(key: string, expected: unknown, value: unknown): boolean;
-  get<T = unknown>(key: string, fallback?: T): T | unknown;
+  get<T = unknown>(key: string): T | unknown;
+  get<T>(key: string, fallback: T): T;
   has(key: string): boolean;
   delete(key: string): boolean;
   scoped(pluginName: string): Omit<CacheApi, "scoped"> & { clearAll(): number };
 }
 
-interface BridgeApi {
+export interface BridgeApi {
   call(name: string, ...args: unknown[]): Promise<unknown>;
 }
 
-interface CryptoHash {
+export interface CryptoHash {
   update(data: string | ArrayBuffer | ArrayBufferView, inputEncoding?: "utf8" | "utf-8" | "hex" | "base64" | "latin1" | "binary"): CryptoHash;
   digest(encoding?: "hex" | "base64" | "latin1" | "binary" | "utf8" | "utf-8" | "buffer"): string | Buffer;
 }
 
-interface CryptoApi {
+export interface CryptoApi {
   createHash(algorithm: "sha256" | "sha-256"): CryptoHash;
   createHmac(algorithm: "sha256" | "sha-256", key: string | ArrayBuffer | ArrayBufferView): CryptoHash;
   randomBytes(size: number): Buffer;
 }
 
+export interface PluginInfo {
+  name: string;
+  version: string;
+  apiVersion: number;
+  description?: string;
+  [key: string]: unknown;
+}
+
+export interface PluginApi {
+  register(info: PluginInfo): PluginInfo;
+  getInfo(name: string): PluginInfo | null;
+  list(): PluginInfo[];
+  clear(): void;
+}
+
+export interface AxiosLike {
+  get(url: string, config?: unknown): Promise<unknown>;
+  post(url: string, data?: unknown, config?: unknown): Promise<unknown>;
+  request(config: unknown): Promise<unknown>;
+}
+
 declare global {
+  var fs: FsApi | undefined;
+  var path: PathApi | undefined;
+  var plugin: PluginApi | undefined;
+  var axios: AxiosLike | undefined;
   var native: NativeApi | undefined;
   var wasi: WasiApi | undefined;
   var cache: CacheApi | undefined;
   var bridge: BridgeApi | undefined;
-  var crypto: CryptoApi | undefined;
   var nodeCryptoCompat: CryptoApi | undefined;
   var uuidv4: (() => string) | undefined;
-  var __caseMain: ((config?: unknown) => Promise<unknown>) | undefined;
-  var __demoMain: (() => Promise<unknown>) | undefined;
 }

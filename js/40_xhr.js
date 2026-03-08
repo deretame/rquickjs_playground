@@ -1,6 +1,44 @@
 (() => {
   const HOST_FORMDATA_BODY_HEADER = "x-rquickjs-host-body-formdata-v1";
   const { nextTick, normalizeMethod, parseBodyInit, Headers, stringToArrayBuffer } = globalThis.__web;
+  const EVENTED_XHR_PENDING = new Map();
+  const prevHttpComplete = globalThis.__host_runtime_http_complete;
+
+  globalThis.__host_runtime_http_complete = function __host_runtime_http_complete(requestId, payloadRaw) {
+    const pending = EVENTED_XHR_PENDING.get(Number(requestId));
+    if (!pending) {
+      if (typeof prevHttpComplete === "function") prevHttpComplete(requestId, payloadRaw);
+      return;
+    }
+    EVENTED_XHR_PENDING.delete(Number(requestId));
+
+    const { xhr, fail } = pending;
+    const payload = JSON.parse(String(payloadRaw || "{}"));
+
+    if (!payload.ok) {
+      fail("error");
+      return;
+    }
+
+    xhr._requestId = null;
+    xhr.status = payload.status || 0;
+    xhr.statusText = payload.statusText || "";
+    xhr.responseURL = payload.url || xhr._url;
+    xhr.offloaded = payload.offloaded === true;
+    xhr.nativeBufferId = xhr.offloaded ? Number(payload.nativeBufferId || 0) : null;
+    xhr.offloadedBytes = Number(payload.offloadedBytes || 0);
+    xhr.wasiApplied = payload.wasiApplied === true;
+    xhr.wasiNeedJsProcessing = payload.wasiNeedJsProcessing === true;
+    xhr.wasiFunction = payload.wasiFunction || null;
+    xhr.wasiOutputType = payload.wasiOutputType || null;
+    xhr._responseHeaders = new Headers(payload.headers || {});
+    xhr._setReadyState(XMLHttpRequest.HEADERS_RECEIVED);
+    xhr.responseText = String(payload.body || "");
+    xhr._setReadyState(XMLHttpRequest.LOADING);
+    xhr._setReadyState(XMLHttpRequest.DONE);
+    xhr.dispatchEvent({ type: "load", target: xhr });
+    xhr.dispatchEvent({ type: "loadend", target: xhr });
+  };
 
   class MiniEventTarget {
     constructor() {
@@ -104,8 +142,13 @@
     abort() {
       this._aborted = true;
       if (this._requestId !== null) {
+        EVENTED_XHR_PENDING.delete(this._requestId);
         try {
-          globalThis.__http_request_drop(this._requestId);
+          if (typeof globalThis.__http_request_drop_evented === "function") {
+            globalThis.__http_request_drop_evented(this._requestId);
+          } else {
+            globalThis.__http_request_drop(this._requestId);
+          }
         } catch (_err) {
         }
         this._requestId = null;
@@ -140,7 +183,7 @@
         const dropPending = () => {
           if (this._requestId === null) return;
           try {
-            globalThis.__http_request_drop(this._requestId);
+            globalThis.__http_request_drop_evented(this._requestId);
           } catch (_err) {
           }
           this._requestId = null;
@@ -154,7 +197,7 @@
           if (bodyInit.hostBodyKind === "formData") {
             this._headers.set(HOST_FORMDATA_BODY_HEADER, "1");
           }
-          const startedRaw = globalThis.__http_request_start(
+          const startedRaw = globalThis.__http_request_start_evented(
             this._method,
             this._url,
             JSON.stringify(this._headers.toObject()),
@@ -167,69 +210,7 @@
           }
 
           this._requestId = Number(started.id);
-
-          const poll = () => {
-            if (this._aborted) {
-              dropPending();
-              return;
-            }
-
-            if (this.timeout > 0 && Date.now() - start > this.timeout) {
-              dropPending();
-              fail("timeout");
-              return;
-            }
-
-            let step;
-            try {
-              step = JSON.parse(globalThis.__http_request_try_take(this._requestId));
-            } catch (_err) {
-              dropPending();
-              fail("error");
-              return;
-            }
-
-            if (!step.ok) {
-              fail("error");
-              return;
-            }
-
-            if (!step.done) {
-              setTimeout(poll, 0);
-              return;
-            }
-
-            this._requestId = null;
-
-            const payload = JSON.parse(step.result || "{}");
-
-            if (!payload.ok) {
-              fail("error");
-              return;
-            }
-
-            this.status = payload.status || 0;
-            this.statusText = payload.statusText || "";
-            this.responseURL = payload.url || this._url;
-            this.offloaded = payload.offloaded === true;
-            this.nativeBufferId = this.offloaded ? Number(payload.nativeBufferId || 0) : null;
-            this.offloadedBytes = Number(payload.offloadedBytes || 0);
-            this.wasiApplied = payload.wasiApplied === true;
-            this.wasiNeedJsProcessing = payload.wasiNeedJsProcessing === true;
-            this.wasiFunction = payload.wasiFunction || null;
-            this.wasiOutputType = payload.wasiOutputType || null;
-            this._responseHeaders = new Headers(payload.headers || {});
-            this._setReadyState(XMLHttpRequest.HEADERS_RECEIVED);
-
-            this.responseText = String(payload.body || "");
-            this._setReadyState(XMLHttpRequest.LOADING);
-            this._setReadyState(XMLHttpRequest.DONE);
-
-            this.dispatchEvent({ type: "load", target: this });
-            this.dispatchEvent({ type: "loadend", target: this });
-          };
-
-          setTimeout(poll, 0);
+          EVENTED_XHR_PENDING.set(this._requestId, { xhr: this, fail });
         } catch (_err) {
           dropPending();
           fail("error");

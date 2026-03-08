@@ -19,7 +19,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use getrandom::fill as random_fill;
 use hmac::{Hmac, Mac};
-use log::Level;
 use reqwest::multipart::{Form as MultipartForm, Part as MultipartPart};
 use reqwest::{Client, Method, Proxy};
 use sha2::{Digest, Sha256};
@@ -32,9 +31,6 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use wasmtime::{Engine, Linker, Module, Store};
 use wasmtime_wasi::WasiCtxBuilder;
-
-#[cfg(test)]
-use rquickjs::{Context, Runtime};
 
 pub const WEB_POLYFILL: &str = concat!(
     include_str!("../js/00_bootstrap.js"),
@@ -135,10 +131,13 @@ pub fn install_host_bindings(ctx: &Ctx<'_>) -> Result<(), rquickjs::Error> {
 
 static HTTP_REQ_ID: AtomicU64 = AtomicU64::new(1);
 static HTTP_REQ_POOL: OnceLock<Mutex<HashMap<u64, PendingTask>>> = OnceLock::new();
+static HTTP_REQ_EVENT_POOL: OnceLock<Mutex<HashMap<u64, PendingAbortTask>>> = OnceLock::new();
 static FS_REQ_ID: AtomicU64 = AtomicU64::new(1);
 static FS_REQ_POOL: OnceLock<Mutex<HashMap<u64, PendingTask>>> = OnceLock::new();
+static FS_REQ_EVENT_POOL: OnceLock<Mutex<HashMap<u64, PendingAbortTask>>> = OnceLock::new();
 static WASI_REQ_ID: AtomicU64 = AtomicU64::new(1);
 static WASI_REQ_POOL: OnceLock<Mutex<HashMap<u64, PendingTask>>> = OnceLock::new();
+static WASI_REQ_EVENT_POOL: OnceLock<Mutex<HashMap<u64, PendingAbortTask>>> = OnceLock::new();
 static WASI_ENGINE: OnceLock<Engine> = OnceLock::new();
 static WASI_MODULE_CACHE: OnceLock<Mutex<HashMap<Vec<u8>, Module>>> = OnceLock::new();
 static WASI_MODULE_CACHE_ORDER: OnceLock<Mutex<VecDeque<Vec<u8>>>> = OnceLock::new();
@@ -164,6 +163,11 @@ static LOG_PENDING: AtomicU64 = AtomicU64::new(0);
 
 struct PendingTask {
     rx: mpsc::Receiver<String>,
+    task: JoinHandle<()>,
+    created_at: Instant,
+}
+
+struct PendingAbortTask {
     task: JoinHandle<()>,
     created_at: Instant,
 }
@@ -209,12 +213,24 @@ fn http_req_pool() -> &'static Mutex<HashMap<u64, PendingTask>> {
     HTTP_REQ_POOL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn http_req_event_pool() -> &'static Mutex<HashMap<u64, PendingAbortTask>> {
+    HTTP_REQ_EVENT_POOL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn fs_req_pool() -> &'static Mutex<HashMap<u64, PendingTask>> {
     FS_REQ_POOL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn fs_req_event_pool() -> &'static Mutex<HashMap<u64, PendingAbortTask>> {
+    FS_REQ_EVENT_POOL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn wasi_req_pool() -> &'static Mutex<HashMap<u64, PendingTask>> {
     WASI_REQ_POOL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn wasi_req_event_pool() -> &'static Mutex<HashMap<u64, PendingAbortTask>> {
+    WASI_REQ_EVENT_POOL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn wasi_engine() -> &'static Engine {
@@ -270,6 +286,30 @@ fn wasi_io_sem() -> &'static Arc<Semaphore> {
 }
 
 fn cleanup_stale_pending(pool: &mut HashMap<u64, PendingTask>, dropped_counter: &AtomicU64) {
+    let now = Instant::now();
+    let stale_ids: Vec<u64> = pool
+        .iter()
+        .filter_map(|(id, pending)| {
+            if now.duration_since(pending.created_at) > PENDING_TASK_TTL {
+                Some(*id)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for id in stale_ids {
+        if let Some(pending) = pool.remove(&id) {
+            pending.task.abort();
+            dropped_counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn cleanup_stale_pending_abort(
+    pool: &mut HashMap<u64, PendingAbortTask>,
+    dropped_counter: &AtomicU64,
+) {
     let now = Instant::now();
     let stale_ids: Vec<u64> = pool
         .iter()
@@ -645,14 +685,13 @@ fn log_sender() -> &'static mpsc::Sender<LogEvent> {
                 while let Ok(event) = rx.recv() {
                     LOG_PENDING.fetch_sub(1, Ordering::Relaxed);
                     let line = format!("[qjs:{}:{}] {}", event.ts_ms, event.level, event.message);
-                    let level = match event.level.as_str() {
-                        "error" => Level::Error,
-                        "warn" => Level::Warn,
-                        "info" => Level::Info,
-                        "debug" => Level::Debug,
-                        _ => Level::Trace,
-                    };
-                    log::log!(level, "{line}");
+                    match event.level.as_str() {
+                        "error" => tracing::error!("{}", line),
+                        "warn" => tracing::warn!("{}", line),
+                        "info" => tracing::info!("{}", line),
+                        "debug" => tracing::debug!("{}", line),
+                        _ => tracing::trace!("{}", line),
+                    }
                     LOG_WRITTEN.fetch_add(1, Ordering::Relaxed);
                 }
             })
@@ -801,6 +840,87 @@ pub fn http_request_drop(id: u64) -> String {
     json!({ "ok": true, "dropped": existed }).to_string()
 }
 
+pub fn http_request_start_evented<F>(
+    method: String,
+    url: String,
+    headers_json: String,
+    body: Option<String>,
+    on_complete: F,
+) -> String
+where
+    F: FnOnce(u64, String) + Send + 'static,
+{
+    {
+        let mut pool = http_req_event_pool()
+            .lock()
+            .expect("http event 请求池加锁失败");
+        cleanup_stale_pending_abort(&mut pool, &HTTP_STALE_DROPS);
+        if pool.len() >= HTTP_MAX_PENDING {
+            return json!({ "ok": false, "error": "http pending 队列已满" }).to_string();
+        }
+    }
+
+    let id = HTTP_REQ_ID.fetch_add(1, Ordering::Relaxed);
+    let sem = Arc::clone(http_io_sem());
+
+    let task = host_async_runtime().spawn(async move {
+        let permit = match timeout(Duration::from_secs(15), sem.acquire_owned()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                on_complete(
+                    id,
+                    json!({ "ok": false, "error": "http 并发控制器不可用" }).to_string(),
+                );
+                return;
+            }
+            Err(_) => {
+                on_complete(
+                    id,
+                    json!({ "ok": false, "error": "http 等待并发许可超时" }).to_string(),
+                );
+                return;
+            }
+        };
+        let payload = match http_request_inner_async(method, url, headers_json, body).await {
+            Ok(payload) => payload,
+            Err(error) => json!({ "ok": false, "error": format!("{error}") }).to_string(),
+        };
+        drop(permit);
+        on_complete(id, payload);
+        let _ = http_req_event_pool()
+            .lock()
+            .map(|mut pool| pool.remove(&id));
+    });
+
+    {
+        let mut pool = http_req_event_pool()
+            .lock()
+            .expect("http event 请求池加锁失败");
+        pool.insert(
+            id,
+            PendingAbortTask {
+                task,
+                created_at: Instant::now(),
+            },
+        );
+    }
+
+    json!({ "ok": true, "id": id }).to_string()
+}
+
+pub fn http_request_drop_evented(id: u64) -> String {
+    let mut pool = http_req_event_pool()
+        .lock()
+        .expect("http event 请求池加锁失败");
+    let existed = if let Some(pending) = pool.remove(&id) {
+        pending.task.abort();
+        true
+    } else {
+        false
+    };
+    json!({ "ok": true, "dropped": existed }).to_string()
+}
+
 pub fn fs_task_start(op: String, args_json: String) -> String {
     {
         let mut pool = fs_req_pool().lock().expect("fs 请求池加锁失败");
@@ -870,6 +990,72 @@ pub fn fs_task_try_take(id: u64) -> String {
 
 pub fn fs_task_drop(id: u64) -> String {
     let mut pool = fs_req_pool().lock().expect("fs 请求池加锁失败");
+    let existed = if let Some(pending) = pool.remove(&id) {
+        pending.task.abort();
+        true
+    } else {
+        false
+    };
+    json!({ "ok": true, "dropped": existed }).to_string()
+}
+
+pub fn fs_task_start_evented<F>(op: String, args_json: String, on_complete: F) -> String
+where
+    F: FnOnce(u64, String) + Send + 'static,
+{
+    {
+        let mut pool = fs_req_event_pool().lock().expect("fs event 请求池加锁失败");
+        cleanup_stale_pending_abort(&mut pool, &FS_STALE_DROPS);
+        if pool.len() >= FS_MAX_PENDING {
+            return json!({ "ok": false, "error": "fs pending 队列已满" }).to_string();
+        }
+    }
+
+    let id = FS_REQ_ID.fetch_add(1, Ordering::Relaxed);
+    let sem = Arc::clone(fs_io_sem());
+
+    let task = host_async_runtime().spawn(async move {
+        let permit = match timeout(Duration::from_secs(15), sem.acquire_owned()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                on_complete(
+                    id,
+                    json!({ "ok": false, "error": "fs 并发控制器不可用" }).to_string(),
+                );
+                return;
+            }
+            Err(_) => {
+                on_complete(
+                    id,
+                    json!({ "ok": false, "error": "fs 等待并发许可超时" }).to_string(),
+                );
+                return;
+            }
+        };
+        let payload = tokio::task::spawn_blocking(move || fs_task_dispatch(op, args_json))
+            .await
+            .unwrap_or_else(|e| json!({ "ok": false, "error": e.to_string() }).to_string());
+        drop(permit);
+        on_complete(id, payload);
+        let _ = fs_req_event_pool().lock().map(|mut pool| pool.remove(&id));
+    });
+
+    {
+        let mut pool = fs_req_event_pool().lock().expect("fs event 请求池加锁失败");
+        pool.insert(
+            id,
+            PendingAbortTask {
+                task,
+                created_at: Instant::now(),
+            },
+        );
+    }
+
+    json!({ "ok": true, "id": id }).to_string()
+}
+
+pub fn fs_task_drop_evented(id: u64) -> String {
+    let mut pool = fs_req_event_pool().lock().expect("fs event 请求池加锁失败");
     let existed = if let Some(pending) = pool.remove(&id) {
         pending.task.abort();
         true
@@ -1152,10 +1338,14 @@ fn validate_cache_key(key: &str) -> AnyResult<()> {
         return Err(anyhow!("cache key 不能为空"));
     }
     let Some((prefix, hashed_key)) = raw.split_once("::") else {
-        return Err(anyhow!("cache key 必须为 {{pluginPrefix}}::{{sha256(key)}} 格式"));
+        return Err(anyhow!(
+            "cache key 必须为 {{pluginPrefix}}::{{sha256(key)}} 格式"
+        ));
     };
     if prefix.is_empty() || hashed_key.is_empty() {
-        return Err(anyhow!("cache key 必须为 {{pluginPrefix}}::{{sha256(key)}} 格式"));
+        return Err(anyhow!(
+            "cache key 必须为 {{pluginPrefix}}::{{sha256(key)}} 格式"
+        ));
     }
     validate_cache_prefix(prefix)?;
     if hashed_key.len() != 64 || !hashed_key.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -1889,6 +2079,88 @@ pub fn wasi_run_drop(id: u64) -> String {
     json!({ "ok": true, "dropped": existed }).to_string()
 }
 
+pub fn wasi_run_start_evented<F>(
+    module_id: u64,
+    stdin_id: Option<u64>,
+    args_json: Option<String>,
+    consume_module: bool,
+    on_complete: F,
+) -> String
+where
+    F: FnOnce(u64, String) + Send + 'static,
+{
+    {
+        let mut pool = wasi_req_event_pool()
+            .lock()
+            .expect("wasi event 请求池加锁失败");
+        cleanup_stale_pending_abort(&mut pool, &WASI_STALE_DROPS);
+        if pool.len() >= WASI_MAX_PENDING {
+            return json!({ "ok": false, "error": "wasi pending 队列已满" }).to_string();
+        }
+    }
+
+    let id = WASI_REQ_ID.fetch_add(1, Ordering::Relaxed);
+    let sem = Arc::clone(wasi_io_sem());
+
+    let task = host_async_runtime().spawn(async move {
+        let permit = match timeout(Duration::from_secs(15), sem.acquire_owned()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                on_complete(
+                    id,
+                    json!({ "ok": false, "error": "wasi 并发控制器不可用" }).to_string(),
+                );
+                return;
+            }
+            Err(_) => {
+                on_complete(
+                    id,
+                    json!({ "ok": false, "error": "wasi 等待并发许可超时" }).to_string(),
+                );
+                return;
+            }
+        };
+        let payload = tokio::task::spawn_blocking(move || {
+            wasi_run_inner(module_id, stdin_id, args_json, consume_module)
+        })
+        .await
+        .unwrap_or_else(|e| json!({ "ok": false, "error": e.to_string() }).to_string());
+        drop(permit);
+        on_complete(id, payload);
+        let _ = wasi_req_event_pool()
+            .lock()
+            .map(|mut pool| pool.remove(&id));
+    });
+
+    {
+        let mut pool = wasi_req_event_pool()
+            .lock()
+            .expect("wasi event 请求池加锁失败");
+        pool.insert(
+            id,
+            PendingAbortTask {
+                task,
+                created_at: Instant::now(),
+            },
+        );
+    }
+
+    json!({ "ok": true, "id": id }).to_string()
+}
+
+pub fn wasi_run_drop_evented(id: u64) -> String {
+    let mut pool = wasi_req_event_pool()
+        .lock()
+        .expect("wasi event 请求池加锁失败");
+    let existed = if let Some(pending) = pool.remove(&id) {
+        pending.task.abort();
+        true
+    } else {
+        false
+    };
+    json!({ "ok": true, "dropped": existed }).to_string()
+}
+
 fn parse_host_ok_payload(raw: String) -> AnyResult<Value> {
     let payload: Value = serde_json::from_str(&raw).context("解析宿主返回 JSON 失败")?;
     if payload.get("ok").and_then(Value::as_bool) == Some(true) {
@@ -1958,20 +2230,180 @@ pub fn call_js_global_function(
     }
 }
 
-pub fn plugin_load(ctx: &Ctx<'_>, script: String) -> AnyResult<()> {
-    ctx.eval::<(), _>(script).context("加载插件脚本失败")
+fn ensure_plugin_registry(ctx: &Ctx<'_>) -> AnyResult<()> {
+    ctx.eval::<(), _>(
+        r#"
+        (() => {
+          const key = "__host_plugin_registry";
+          if (!(globalThis[key] instanceof Map)) {
+            Object.defineProperty(globalThis, key, {
+              value: new Map(),
+              writable: false,
+              enumerable: false,
+              configurable: false,
+            });
+          }
+        })();
+        "#,
+    )
+    .context("初始化插件注册表失败")
+}
+
+fn eval_json_payload_script(
+    ctx: &Ctx<'_>,
+    script: String,
+    error_context: &'static str,
+) -> AnyResult<Value> {
+    let promise: Promise = ctx.eval(script).context(error_context)?;
+    let raw: String = promise.finish().context("等待 JS Promise 失败")?;
+    let payload: Value = serde_json::from_str(&raw).context("解析 JS 返回 JSON 失败")?;
+    if payload.get("ok").and_then(Value::as_bool) == Some(true) {
+        Ok(payload.get("data").cloned().unwrap_or(Value::Null))
+    } else {
+        Err(anyhow!(
+            "{}",
+            payload
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("调用失败")
+        ))
+    }
+}
+
+pub fn plugin_load_bundle(ctx: &Ctx<'_>, name: String, script: String) -> AnyResult<()> {
+    ensure_plugin_registry(ctx)?;
+
+    let name_json = serde_json::to_string(&name).context("序列化插件名失败")?;
+    let script_json = serde_json::to_string(&script).context("序列化插件脚本失败")?;
+
+    let load_script = format!(
+        r#"
+        (async () => {{
+          try {{
+            const pluginName = {name_json};
+            const source = {script_json};
+            const registry = globalThis.__host_plugin_registry;
+            if (!(registry instanceof Map)) {{
+              throw new TypeError("插件注册表不可用");
+            }}
+
+            const module = {{ exports: {{}} }};
+            const exports = module.exports;
+            const requireFn = typeof globalThis.require === "function"
+              ? globalThis.require.bind(globalThis)
+              : undefined;
+            const runner = new Function("module", "exports", "require", source);
+            runner(module, exports, requireFn);
+
+            let api = module.exports;
+            if (api && typeof api === "object" && api.default !== undefined) {{
+              api = api.default;
+            }}
+            if (typeof api === "function") {{
+              api = {{ default: api }};
+            }}
+            if (!api || typeof api !== "object") {{
+              throw new TypeError("插件必须导出对象或默认对象导出");
+            }}
+
+            registry.set(pluginName, api);
+            return JSON.stringify({{ ok: true, data: null }});
+          }} catch (err) {{
+            const message = String(err && (err.stack || err.message) ? (err.stack || err.message) : err);
+            return JSON.stringify({{ ok: false, error: message }});
+          }}
+        }})()
+        "#
+    );
+
+    eval_json_payload_script(ctx, load_script, "加载插件 bundle 失败")?;
+    Ok(())
+}
+
+pub fn plugin_call(
+    ctx: &Ctx<'_>,
+    plugin_name: String,
+    function_name: String,
+    args_json: Option<String>,
+) -> AnyResult<Value> {
+    ensure_plugin_registry(ctx)?;
+
+    let args = parse_bridge_args(args_json)?;
+    let plugin_name_json = serde_json::to_string(&plugin_name).context("序列化插件名失败")?;
+    let function_name_json = serde_json::to_string(&function_name).context("序列化函数名失败")?;
+    let args_literal = serde_json::to_string(&args).context("序列化插件调用参数失败")?;
+
+    let script = format!(
+        r#"
+        (async () => {{
+          try {{
+            const pluginName = {plugin_name_json};
+            const fnName = {function_name_json};
+            const args = {args_literal};
+            const registry = globalThis.__host_plugin_registry;
+            if (!(registry instanceof Map)) {{
+              throw new TypeError("插件注册表不可用");
+            }}
+
+            const api = registry.get(pluginName);
+            if (!api || typeof api !== "object") {{
+              throw new Error(`插件不存在: ${{pluginName}}`);
+            }}
+
+            const fn = api[fnName];
+            if (typeof fn !== "function") {{
+              throw new Error(`插件 ${{pluginName}} 未导出函数: ${{fnName}}`);
+            }}
+
+            const data = await fn.apply(api, args);
+            return JSON.stringify({{ ok: true, data }});
+          }} catch (err) {{
+            const message = String(err && (err.stack || err.message) ? (err.stack || err.message) : err);
+            return JSON.stringify({{ ok: false, error: message }});
+          }}
+        }})()
+        "#
+    );
+
+    eval_json_payload_script(ctx, script, "执行插件函数失败")
 }
 
 pub fn plugin_get_info(ctx: &Ctx<'_>, name: String) -> AnyResult<Value> {
-    call_js_global_function(
-        ctx,
-        "__plugin_host_get_info".to_string(),
-        Some(json!([name]).to_string()),
-    )
+    plugin_call(ctx, name, "getInfo".to_string(), None)
 }
 
 pub fn plugin_list(ctx: &Ctx<'_>) -> AnyResult<Value> {
-    call_js_global_function(ctx, "__plugin_host_list".to_string(), None)
+    ensure_plugin_registry(ctx)?;
+    let script = r#"
+        (async () => {
+          try {
+            const registry = globalThis.__host_plugin_registry;
+            if (!(registry instanceof Map)) {
+              throw new TypeError("插件注册表不可用");
+            }
+
+            const list = [];
+            for (const [name, api] of registry.entries()) {
+              if (api && typeof api.getInfo === "function") {
+                const info = await api.getInfo();
+                if (info && typeof info === "object" && !Array.isArray(info)) {
+                  list.push({ ...info, name: String(info.name || name) });
+                  continue;
+                }
+              }
+              list.push({ name });
+            }
+
+            return JSON.stringify({ ok: true, data: list });
+          } catch (err) {
+            const message = String(err && (err.stack || err.message) ? (err.stack || err.message) : err);
+            return JSON.stringify({ ok: false, error: message });
+          }
+        })()
+    "#
+    .to_string();
+
+    eval_json_payload_script(ctx, script, "读取插件列表失败")
 }
 
 fn require_arg<'a>(args: &'a [Value], index: usize, name: &str) -> AnyResult<&'a Value> {
@@ -2533,19 +2965,7 @@ fn run_async_script_internal(
     script: &str,
     load_axios: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let runtime = Runtime::new()?;
-    let context = Context::full(&runtime)?;
-
-    context
-        .with(|ctx| {
-            install_host_bindings(&ctx)?;
-            ctx.eval::<(), _>(WEB_POLYFILL)?;
-            if load_axios {
-                ctx.eval::<(), _>(AXIOS_BUNDLE)?;
-            }
-            let promise: Promise = ctx.eval(script)?;
-            let result: String = promise.finish()?;
-            Ok::<String, rquickjs::Error>(result)
-        })
-        .map_err(|e| e.into())
+    let runtime = crate::host_runtime::AsyncHostRuntime::new(load_axios)?;
+    let task = runtime.spawn(script)?;
+    task.wait().map_err(|e| e.into())
 }
