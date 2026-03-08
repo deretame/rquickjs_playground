@@ -4,7 +4,7 @@ use axum::Json;
 use axum::Router;
 use axum::extract::Query;
 use axum::routing::get;
-use rquickjs_playground::HostRuntime;
+use rquickjs_playground::AsyncHostRuntime;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
@@ -65,10 +65,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let rust_start = Instant::now();
     let raw = tokio::task::spawn_blocking(move || {
-        let host = HostRuntime::new(false).expect("创建 HostRuntime 失败");
-        host.eval_async(&script).expect("执行 JS 脚本失败")
+        let host = AsyncHostRuntime::new(false).expect("创建 HostRuntime 失败");
+        host.spawn(&script).expect("执行 JS 脚本失败").wait()
     })
-    .await?;
+    .await??;
     let rust_elapsed = rust_start.elapsed().as_millis();
 
     let parsed: Value = serde_json::from_str(&raw)?;

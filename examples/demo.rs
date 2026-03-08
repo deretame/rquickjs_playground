@@ -1,7 +1,7 @@
-use rquickjs_playground::HostRuntime;
+use rquickjs_playground::AsyncHostRuntime;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let host = HostRuntime::new(true)?;
+    let host = AsyncHostRuntime::new(true)?;
 
     let script = r#"
         (async () => {
@@ -22,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })()
     "#;
 
-    let result = host.eval_async(script)?;
+    let result = host.spawn(script)?.wait()?;
     println!("{result}");
     Ok(())
 }

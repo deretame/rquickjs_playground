@@ -1,4 +1,4 @@
-use rquickjs_playground::HostRuntime;
+use rquickjs_playground::AsyncHostRuntime;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -44,9 +44,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "#
     );
 
-    let host = HostRuntime::new(false)?;
+    let host = AsyncHostRuntime::new(false)?;
     let start = Instant::now();
-    let raw = host.eval_async(&script)?;
+    let raw = host.spawn(&script)?.wait()?;
     let rust_elapsed = start.elapsed().as_millis();
 
     let parsed: Value = serde_json::from_str(&raw)?;

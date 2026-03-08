@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 
-use rquickjs_playground::HostRuntime;
+use rquickjs_playground::AsyncHostRuntime;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
@@ -58,8 +58,10 @@ impl PluginManager {
             workers.push(tx);
 
             thread::spawn(move || {
-                let host = HostRuntime::new(false).expect("创建 HostRuntime 失败");
-                host.eval_async(plugin_bootstrap_script())
+                let host = AsyncHostRuntime::new(false).expect("创建 HostRuntime 失败");
+                host.spawn(plugin_bootstrap_script())
+                    .expect("初始化插件脚本失败")
+                    .wait()
                     .expect("初始化插件脚本失败");
 
                 let info = get_plugin_info(&host, "test1", &json!({ "tag": "worker-init" }))
@@ -141,7 +143,7 @@ impl PluginManager {
     }
 }
 
-fn invoke_one(host: &HostRuntime, item: &InvokeItem) -> Result<Value, String> {
+fn invoke_one(host: &AsyncHostRuntime, item: &InvokeItem) -> Result<Value, String> {
     let name_json = serde_json::to_string(&item.plugin_name).map_err(|e| e.to_string())?;
     let function_json = serde_json::to_string(&item.function).map_err(|e| e.to_string())?;
     let args_json = serde_json::to_string(&item.args).map_err(|e| e.to_string())?;
@@ -159,7 +161,7 @@ fn invoke_one(host: &HostRuntime, item: &InvokeItem) -> Result<Value, String> {
         "#
     );
 
-    let raw = host.eval_async(&script).map_err(|e| e.to_string())?;
+    let raw = host.spawn(&script).map_err(|e| e.to_string())?.wait().map_err(|e| e.to_string())?;
     let payload: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     if payload.get("ok").and_then(Value::as_bool) == Some(true) {
         Ok(payload.get("data").cloned().unwrap_or(Value::Null))
@@ -254,7 +256,7 @@ fn plugin_bootstrap_script() -> &'static str {
     "#
 }
 
-fn get_plugin_info(host: &HostRuntime, plugin_name: &str, query: &Value) -> Result<Value, String> {
+fn get_plugin_info(host: &AsyncHostRuntime, plugin_name: &str, query: &Value) -> Result<Value, String> {
     let name_json = serde_json::to_string(plugin_name).map_err(|e| e.to_string())?;
     let query_json = serde_json::to_string(query).map_err(|e| e.to_string())?;
 
@@ -271,7 +273,7 @@ fn get_plugin_info(host: &HostRuntime, plugin_name: &str, query: &Value) -> Resu
         "#
     );
 
-    let raw = host.eval_async(&script).map_err(|e| e.to_string())?;
+    let raw = host.spawn(&script).map_err(|e| e.to_string())?.wait().map_err(|e| e.to_string())?;
     let payload: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     if payload.get("ok").and_then(Value::as_bool) == Some(true) {
         Ok(payload.get("data").cloned().unwrap_or(Value::Null))
