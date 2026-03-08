@@ -1,1 +1,0 @@
-"use strict";(()=>{(()=>{async function a(){let i=globalThis.native;if(!i)return{ok:!1,reason:"runtime-native-missing"};let n=await i.chain(["invert","invert"],new Uint8Array([7,8,9]));return{ok:n[0]===7&&n[1]===8&&n[2]===9}}globalThis.__caseMain=a})();})();
