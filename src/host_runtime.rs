@@ -10,10 +10,12 @@ use std::thread;
 use tokio::sync::oneshot;
 
 use crate::web_runtime::{
-    fs_task_drop_evented, fs_task_start_evented, http_request_drop_evented,
-    http_request_start_evented, install_host_bindings, wasi_run_drop_evented,
-    wasi_run_start_evented, AXIOS_BUNDLE, WEB_POLYFILL,
+    http_request_drop_evented, http_request_start_evented, install_host_bindings,
+    wasi_run_drop_evented, wasi_run_start_evented, AXIOS_BUNDLE, WEB_POLYFILL,
 };
+
+#[cfg(feature = "host-fs")]
+use crate::web_runtime::{fs_task_drop_evented, fs_task_start_evented};
 
 const ASYNC_TASK_DISPATCHER_JS: &str = r#"(function () {
   globalThis.__host_runtime_dispatch_task = function (__runtimeId, __taskId, __source) {
@@ -104,6 +106,7 @@ enum AsyncCommand {
 
 enum HostEvent {
     HttpCompleted { id: u64, payload: String },
+    #[cfg(feature = "host-fs")]
     FsCompleted { id: u64, payload: String },
     WasiCompleted { id: u64, payload: String },
 }
@@ -599,17 +602,20 @@ fn install_evented_host_bindings_worker(
     )?;
     globals.set("__http_request_drop_evented", Func::from(http_request_drop_evented))?;
 
-    let fs_tx = signal_tx.clone();
-    globals.set(
-        "__fs_task_start_evented",
-        Function::new(ctx.clone(), move |op: String, args_json: String| {
-            let tx = fs_tx.clone();
-            fs_task_start_evented(op, args_json, move |id, payload| {
-                let _ = tx.send(WorkerSignal::HostEvent(HostEvent::FsCompleted { id, payload }));
-            })
-        })?,
-    )?;
-    globals.set("__fs_task_drop_evented", Func::from(fs_task_drop_evented))?;
+    #[cfg(feature = "host-fs")]
+    {
+        let fs_tx = signal_tx.clone();
+        globals.set(
+            "__fs_task_start_evented",
+            Function::new(ctx.clone(), move |op: String, args_json: String| {
+                let tx = fs_tx.clone();
+                fs_task_start_evented(op, args_json, move |id, payload| {
+                    let _ = tx.send(WorkerSignal::HostEvent(HostEvent::FsCompleted { id, payload }));
+                })
+            })?,
+        )?;
+        globals.set("__fs_task_drop_evented", Func::from(fs_task_drop_evented))?;
+    }
 
     let wasi_tx = signal_tx;
     globals.set(
@@ -698,6 +704,7 @@ fn handle_host_event_in_ctx(ctx: rquickjs::Ctx<'_>, event: HostEvent) -> Result<
             let func: Function = globals.get("__host_runtime_http_complete")?;
             func.call::<_, ()>((id, payload))
         }
+        #[cfg(feature = "host-fs")]
         HostEvent::FsCompleted { id, payload } => {
             let func: Function = globals.get("__host_runtime_fs_complete")?;
             func.call::<_, ()>((id, payload))

@@ -55,6 +55,8 @@ export interface CacheApi {
 }
 
 export interface BridgeApi {
+  call(name: "crypto.md5_hex", input: string): Promise<string>;
+  call(name: "crypto.aes_ecb_pkcs7_decrypt_b64", payloadB64: string, keyRaw: string): Promise<string>;
   call(name: string, ...args: unknown[]): Promise<unknown>;
 }
 

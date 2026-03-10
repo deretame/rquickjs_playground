@@ -1,6 +1,8 @@
+use aes::{Aes128, Aes192, Aes256};
 use anyhow::{Context as AnyhowContext, Result as AnyResult, anyhow};
 use base64::Engine as Base64Engine;
 use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE as BASE64_URL_SAFE};
+use ecb::cipher::{BlockDecryptMut, KeyInit, block_padding::Pkcs7};
 use serde::Deserialize;
 use serde_json::Map;
 use serde_json::{Value, json};
@@ -32,6 +34,7 @@ use tokio::time::timeout;
 use wasmtime::{Engine, Linker, Module, Store};
 use wasmtime_wasi::WasiCtxBuilder;
 
+#[cfg(feature = "host-fs")]
 pub const WEB_POLYFILL: &str = concat!(
     include_str!("../js/00_bootstrap.js"),
     "\n",
@@ -44,6 +47,34 @@ pub const WEB_POLYFILL: &str = concat!(
     include_str!("../js/40_xhr.js"),
     "\n",
     include_str!("../js/50_fs.js"),
+    "\n",
+    include_str!("../js/60_native.js"),
+    "\n",
+    include_str!("../js/61_wasi.js"),
+    "\n",
+    include_str!("../js/62_bridge.js"),
+    "\n",
+    include_str!("../js/63_plugin.js"),
+    "\n",
+    include_str!("../js/64_cache.js"),
+    "\n",
+    include_str!("../js/65_console.js"),
+    "\n",
+    include_str!("../js/99_exports.js"),
+    "\n"
+);
+
+#[cfg(not(feature = "host-fs"))]
+pub const WEB_POLYFILL: &str = concat!(
+    include_str!("../js/00_bootstrap.js"),
+    "\n",
+    include_str!("../js/10_headers.js"),
+    "\n",
+    include_str!("../js/20_abort.js"),
+    "\n",
+    include_str!("../js/30_fetch.js"),
+    "\n",
+    include_str!("../js/40_xhr.js"),
     "\n",
     include_str!("../js/60_native.js"),
     "\n",
@@ -103,29 +134,32 @@ pub fn install_host_bindings(ctx: &Ctx<'_>) -> Result<(), rquickjs::Error> {
         "__crypto_random_bytes_b64",
         Func::from(crypto_random_bytes_b64),
     )?;
-    globals.set("__fs_read_file", Func::from(fs_read_file))?;
-    globals.set("__fs_write_file", Func::from(fs_write_file))?;
-    globals.set("__fs_mkdir", Func::from(fs_mkdir))?;
-    globals.set("__fs_readdir", Func::from(fs_readdir))?;
-    globals.set("__fs_stat", Func::from(fs_stat))?;
-    globals.set("__fs_access", Func::from(fs_access))?;
-    globals.set("__fs_unlink", Func::from(fs_unlink))?;
-    globals.set("__fs_rm", Func::from(fs_rm))?;
-    globals.set("__fs_rename", Func::from(fs_rename))?;
-    globals.set("__fs_copy_file", Func::from(fs_copy_file))?;
-    globals.set("__fs_realpath", Func::from(fs_realpath))?;
-    globals.set("__fs_lstat", Func::from(fs_lstat))?;
-    globals.set("__fs_readlink", Func::from(fs_readlink))?;
-    globals.set("__fs_symlink", Func::from(fs_symlink))?;
-    globals.set("__fs_link", Func::from(fs_link))?;
-    globals.set("__fs_truncate", Func::from(fs_truncate))?;
-    globals.set("__fs_chmod", Func::from(fs_chmod))?;
-    globals.set("__fs_utimes", Func::from(fs_utimes))?;
-    globals.set("__fs_cp", Func::from(fs_cp))?;
-    globals.set("__fs_mkdtemp", Func::from(fs_mkdtemp))?;
-    globals.set("__fs_task_start", Func::from(fs_task_start))?;
-    globals.set("__fs_task_try_take", Func::from(fs_task_try_take))?;
-    globals.set("__fs_task_drop", Func::from(fs_task_drop))?;
+    #[cfg(feature = "host-fs")]
+    {
+        globals.set("__fs_read_file", Func::from(fs_read_file))?;
+        globals.set("__fs_write_file", Func::from(fs_write_file))?;
+        globals.set("__fs_mkdir", Func::from(fs_mkdir))?;
+        globals.set("__fs_readdir", Func::from(fs_readdir))?;
+        globals.set("__fs_stat", Func::from(fs_stat))?;
+        globals.set("__fs_access", Func::from(fs_access))?;
+        globals.set("__fs_unlink", Func::from(fs_unlink))?;
+        globals.set("__fs_rm", Func::from(fs_rm))?;
+        globals.set("__fs_rename", Func::from(fs_rename))?;
+        globals.set("__fs_copy_file", Func::from(fs_copy_file))?;
+        globals.set("__fs_realpath", Func::from(fs_realpath))?;
+        globals.set("__fs_lstat", Func::from(fs_lstat))?;
+        globals.set("__fs_readlink", Func::from(fs_readlink))?;
+        globals.set("__fs_symlink", Func::from(fs_symlink))?;
+        globals.set("__fs_link", Func::from(fs_link))?;
+        globals.set("__fs_truncate", Func::from(fs_truncate))?;
+        globals.set("__fs_chmod", Func::from(fs_chmod))?;
+        globals.set("__fs_utimes", Func::from(fs_utimes))?;
+        globals.set("__fs_cp", Func::from(fs_cp))?;
+        globals.set("__fs_mkdtemp", Func::from(fs_mkdtemp))?;
+        globals.set("__fs_task_start", Func::from(fs_task_start))?;
+        globals.set("__fs_task_try_take", Func::from(fs_task_try_take))?;
+        globals.set("__fs_task_drop", Func::from(fs_task_drop))?;
+    }
     Ok(())
 }
 
@@ -400,7 +434,7 @@ fn crypto_hmac_sha256_b64(key_b64: String, input_b64: String) -> String {
     let result: AnyResult<String> = (|| {
         let key = decode_host_base64(&key_b64).context("解析 hmac key 失败")?;
         let input = decode_host_base64(&input_b64).context("解析 hmac 输入失败")?;
-        let mut mac = HmacSha256::new_from_slice(&key).context("初始化 hmac 失败")?;
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(&key).context("初始化 hmac 失败")?;
         mac.update(&input);
         let out = mac.finalize().into_bytes();
         Ok(json!({
@@ -2440,6 +2474,45 @@ fn parse_u8_json_value(value: &Value) -> AnyResult<Vec<u8>> {
     Ok(out)
 }
 
+fn crypto_md5_hex(input: String) -> AnyResult<Value> {
+    let digest = md5::compute(input.as_bytes());
+    Ok(json!(format!("{:x}", digest)))
+}
+
+fn crypto_aes_ecb_pkcs7_decrypt_b64(payload_b64: String, key_raw: String) -> AnyResult<Value> {
+    let mut payload = BASE64_STANDARD
+        .decode(payload_b64.as_bytes())
+        .context("base64 解码失败")?;
+    let key = key_raw.into_bytes();
+
+    let plain = match key.len() {
+        16 => ecb::Decryptor::<Aes128>::new_from_slice(&key)
+            .map_err(|_| anyhow!("AES-128 密钥长度无效"))?
+            .decrypt_padded_mut::<Pkcs7>(&mut payload)
+            .map_err(|_| anyhow!("AES-128 ECB 解密失败"))?
+            .to_vec(),
+        24 => ecb::Decryptor::<Aes192>::new_from_slice(&key)
+            .map_err(|_| anyhow!("AES-192 密钥长度无效"))?
+            .decrypt_padded_mut::<Pkcs7>(&mut payload)
+            .map_err(|_| anyhow!("AES-192 ECB 解密失败"))?
+            .to_vec(),
+        32 => ecb::Decryptor::<Aes256>::new_from_slice(&key)
+            .map_err(|_| anyhow!("AES-256 密钥长度无效"))?
+            .decrypt_padded_mut::<Pkcs7>(&mut payload)
+            .map_err(|_| anyhow!("AES-256 ECB 解密失败"))?
+            .to_vec(),
+        _ => {
+            return Err(anyhow!(
+                "AES ECB 密钥长度必须是 16/24/32 字节，当前: {}",
+                key.len()
+            ));
+        }
+    };
+
+    let text = String::from_utf8(plain).context("解密结果不是有效 UTF-8")?;
+    Ok(json!(text))
+}
+
 fn bridge_call_inner(name: String, args_json: Option<String>) -> AnyResult<Value> {
     let args = parse_bridge_args(args_json)?;
 
@@ -2479,6 +2552,15 @@ fn bridge_call_inner(name: String, args_json: Option<String>) -> AnyResult<Value
             let payload =
                 parse_host_ok_payload(native_exec(op, input_id, args_json, extra_input_id))?;
             Ok(payload.get("id").cloned().unwrap_or(Value::Null))
+        }
+        "crypto.md5_hex" => {
+            let input = require_str_arg(&args, 0, "input")?;
+            crypto_md5_hex(input)
+        }
+        "crypto.aes_ecb_pkcs7_decrypt_b64" => {
+            let payload_b64 = require_str_arg(&args, 0, "payloadB64")?;
+            let key_raw = require_str_arg(&args, 1, "keyRaw")?;
+            crypto_aes_ecb_pkcs7_decrypt_b64(payload_b64, key_raw)
         }
         _ => Err(anyhow!("不支持的 bridge 方法: {name}")),
     }
