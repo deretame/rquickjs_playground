@@ -51,7 +51,6 @@ export interface CacheApi {
   get<T>(key: string, fallback: T): T;
   has(key: string): boolean;
   delete(key: string): boolean;
-  scoped(pluginName: string): Omit<CacheApi, "scoped"> & { clearAll(): number };
 }
 
 export interface BridgeApi {

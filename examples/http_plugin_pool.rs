@@ -31,12 +31,13 @@ impl PluginManager {
     fn new(worker_count: usize) -> Self {
         let mut workers = Vec::with_capacity(worker_count);
 
-        for _ in 0..worker_count {
+        for worker_id in 0..worker_count {
             let (tx, rx) = mpsc::channel::<WorkerJob>();
             workers.push(tx);
 
             thread::spawn(move || {
-                let host = AsyncHostRuntime::new(false).expect("创建 HostRuntime 失败");
+                let host = AsyncHostRuntime::new(false, format!("example-http-plugin-worker-{worker_id}"))
+                    .expect("创建 HostRuntime 失败");
                 host.spawn(plugin_bootstrap_script())
                     .expect("初始化插件脚本失败")
                     .wait()
@@ -331,7 +332,8 @@ async fn main() {
     );
 
     let result = tokio::task::spawn_blocking(move || {
-        let host = AsyncHostRuntime::new(false).expect("创建 HostRuntime 失败");
+        let host = AsyncHostRuntime::new(false, "example-http-plugin-main")
+            .expect("创建 HostRuntime 失败");
         host.spawn(&script).expect("执行 JS 请求失败").wait().expect("执行 JS 请求失败")
     })
     .await

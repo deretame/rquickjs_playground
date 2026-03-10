@@ -26,7 +26,7 @@ use reqwest::{Client, Method, Proxy};
 use sha2::{Digest, Sha256};
 
 use filetime::{FileTime, set_file_times};
-use rquickjs::{Ctx, Promise, function::Func};
+use rquickjs::{Ctx, Function, Promise, function::Func};
 use tokio::runtime::{Builder as TokioRuntimeBuilder, Runtime as TokioRuntime};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
@@ -98,7 +98,8 @@ pub const AXIOS_BUNDLE: &str = include_str!("../vendor/axios.min.js");
 #[cfg(not(test))]
 pub const AXIOS_BUNDLE: &str = "";
 
-pub fn install_host_bindings(ctx: &Ctx<'_>) -> Result<(), rquickjs::Error> {
+pub fn install_host_bindings(ctx: &Ctx<'_>, cache_scope_id: &str) -> Result<(), rquickjs::Error> {
+    let cache_scope_id = normalize_runtime_cache_scope_id(cache_scope_id);
     let globals = ctx.globals();
     globals.set("__http_request_start", Func::from(http_request_start))?;
     globals.set("__http_request_try_take", Func::from(http_request_try_take))?;
@@ -117,12 +118,44 @@ pub fn install_host_bindings(ctx: &Ctx<'_>) -> Result<(), rquickjs::Error> {
     globals.set("__wasi_run_start", Func::from(wasi_run_start))?;
     globals.set("__wasi_run_try_take", Func::from(wasi_run_try_take))?;
     globals.set("__wasi_run_drop", Func::from(wasi_run_drop))?;
-    globals.set("__cache_set", Func::from(cache_set))?;
-    globals.set("__cache_set_if_absent", Func::from(cache_set_if_absent))?;
-    globals.set("__cache_compare_and_set", Func::from(cache_compare_and_set))?;
-    globals.set("__cache_get", Func::from(cache_get))?;
-    globals.set("__cache_delete", Func::from(cache_delete))?;
-    globals.set("__cache_clear_prefix", Func::from(cache_clear_prefix))?;
+    let cache_scope_for_set = cache_scope_id.clone();
+    globals.set(
+        "__cache_set",
+        Function::new(ctx.clone(), move |key: String, value_json: String| {
+            cache_set(cache_scope_for_set.clone(), key, value_json)
+        })?,
+    )?;
+    let cache_scope_for_set_if_absent = cache_scope_id.clone();
+    globals.set(
+        "__cache_set_if_absent",
+        Function::new(ctx.clone(), move |key: String, value_json: String| {
+            cache_set_if_absent(cache_scope_for_set_if_absent.clone(), key, value_json)
+        })?,
+    )?;
+    let cache_scope_for_cas = cache_scope_id.clone();
+    globals.set(
+        "__cache_compare_and_set",
+        Function::new(
+            ctx.clone(),
+            move |key: String, expected_json: String, value_json: String| {
+                cache_compare_and_set(cache_scope_for_cas.clone(), key, expected_json, value_json)
+            },
+        )?,
+    )?;
+    let cache_scope_for_get = cache_scope_id.clone();
+    globals.set(
+        "__cache_get",
+        Function::new(ctx.clone(), move |key: String| {
+            cache_get(cache_scope_for_get.clone(), key)
+        })?,
+    )?;
+    let cache_scope_for_delete = cache_scope_id.clone();
+    globals.set(
+        "__cache_delete",
+        Function::new(ctx.clone(), move |key: String| {
+            cache_delete(cache_scope_for_delete.clone(), key)
+        })?,
+    )?;
     globals.set("__log_emit", Func::from(log_emit))?;
     globals.set("__runtime_stats", Func::from(runtime_stats))?;
     globals.set("__crypto_sha256_b64", Func::from(crypto_sha256_b64))?;
@@ -229,10 +262,6 @@ enum CacheCommand {
     },
     Delete {
         key: String,
-        reply_tx: mpsc::Sender<String>,
-    },
-    ClearByPrefix {
-        prefix: String,
         reply_tx: mpsc::Sender<String>,
     },
 }
@@ -692,13 +721,6 @@ fn cache_sender() -> &'static mpsc::Sender<CacheCommand> {
                         CacheCommand::Delete { key, reply_tx } => {
                             let existed = map.remove(&key).is_some();
                             let _ = reply_tx.send(json!({ "ok": true, "deleted": existed }).to_string());
-                        }
-                        CacheCommand::ClearByPrefix { prefix, reply_tx } => {
-                            let before = map.len();
-                            let marker = format!("{prefix}::");
-                            map.retain(|k, _| !k.starts_with(&marker));
-                            let deleted = before.saturating_sub(map.len());
-                            let _ = reply_tx.send(json!({ "ok": true, "deleted": deleted }).to_string());
                         }
                     }
                 }
@@ -1257,10 +1279,11 @@ fn fs_task_dispatch(op: String, args_json: String) -> String {
     }
 }
 
-pub fn cache_set(key: String, value_json: String) -> String {
+pub fn cache_set(cache_scope_id: String, key: String, value_json: String) -> String {
     if let Err(err) = validate_cache_key(&key) {
         return json!({ "ok": false, "error": format!("{err:#}") }).to_string();
     }
+    let key = qualify_cache_key(&cache_scope_id, &key);
     let (reply_tx, reply_rx) = mpsc::channel::<String>();
     if let Err(e) = cache_sender().send(CacheCommand::Set {
         key,
@@ -1277,10 +1300,11 @@ pub fn cache_set(key: String, value_json: String) -> String {
     }
 }
 
-pub fn cache_set_if_absent(key: String, value_json: String) -> String {
+pub fn cache_set_if_absent(cache_scope_id: String, key: String, value_json: String) -> String {
     if let Err(err) = validate_cache_key(&key) {
         return json!({ "ok": false, "error": format!("{err:#}") }).to_string();
     }
+    let key = qualify_cache_key(&cache_scope_id, &key);
     let (reply_tx, reply_rx) = mpsc::channel::<String>();
     if let Err(e) = cache_sender().send(CacheCommand::SetIfAbsent {
         key,
@@ -1297,10 +1321,16 @@ pub fn cache_set_if_absent(key: String, value_json: String) -> String {
     }
 }
 
-pub fn cache_compare_and_set(key: String, expected_json: String, value_json: String) -> String {
+pub fn cache_compare_and_set(
+    cache_scope_id: String,
+    key: String,
+    expected_json: String,
+    value_json: String,
+) -> String {
     if let Err(err) = validate_cache_key(&key) {
         return json!({ "ok": false, "error": format!("{err:#}") }).to_string();
     }
+    let key = qualify_cache_key(&cache_scope_id, &key);
     let (reply_tx, reply_rx) = mpsc::channel::<String>();
     if let Err(e) = cache_sender().send(CacheCommand::CompareAndSet {
         key,
@@ -1318,10 +1348,11 @@ pub fn cache_compare_and_set(key: String, expected_json: String, value_json: Str
     }
 }
 
-pub fn cache_get(key: String) -> String {
+pub fn cache_get(cache_scope_id: String, key: String) -> String {
     if let Err(err) = validate_cache_key(&key) {
         return json!({ "ok": false, "error": format!("{err:#}") }).to_string();
     }
+    let key = qualify_cache_key(&cache_scope_id, &key);
     let (reply_tx, reply_rx) = mpsc::channel::<String>();
     if let Err(e) = cache_sender().send(CacheCommand::Get { key, reply_tx }) {
         return json!({ "ok": false, "error": format!("cache worker 不可用: {e}") }).to_string();
@@ -1334,28 +1365,13 @@ pub fn cache_get(key: String) -> String {
     }
 }
 
-pub fn cache_delete(key: String) -> String {
+pub fn cache_delete(cache_scope_id: String, key: String) -> String {
     if let Err(err) = validate_cache_key(&key) {
         return json!({ "ok": false, "error": format!("{err:#}") }).to_string();
     }
+    let key = qualify_cache_key(&cache_scope_id, &key);
     let (reply_tx, reply_rx) = mpsc::channel::<String>();
     if let Err(e) = cache_sender().send(CacheCommand::Delete { key, reply_tx }) {
-        return json!({ "ok": false, "error": format!("cache worker 不可用: {e}") }).to_string();
-    }
-    match reply_rx.recv() {
-        Ok(raw) => raw,
-        Err(e) => {
-            json!({ "ok": false, "error": format!("cache worker 响应失败: {e}") }).to_string()
-        }
-    }
-}
-
-pub fn cache_clear_prefix(prefix: String) -> String {
-    if let Err(err) = validate_cache_prefix(&prefix) {
-        return json!({ "ok": false, "error": format!("{err:#}") }).to_string();
-    }
-    let (reply_tx, reply_rx) = mpsc::channel::<String>();
-    if let Err(e) = cache_sender().send(CacheCommand::ClearByPrefix { prefix, reply_tx }) {
         return json!({ "ok": false, "error": format!("cache worker 不可用: {e}") }).to_string();
     }
     match reply_rx.recv() {
@@ -1371,39 +1387,45 @@ fn validate_cache_key(key: &str) -> AnyResult<()> {
     if raw.is_empty() {
         return Err(anyhow!("cache key 不能为空"));
     }
-    let Some((prefix, hashed_key)) = raw.split_once("::") else {
-        return Err(anyhow!(
-            "cache key 必须为 {{pluginPrefix}}::{{sha256(key)}} 格式"
-        ));
-    };
-    if prefix.is_empty() || hashed_key.is_empty() {
-        return Err(anyhow!(
-            "cache key 必须为 {{pluginPrefix}}::{{sha256(key)}} 格式"
-        ));
+    if raw.chars().count() > 240 {
+        return Err(anyhow!("cache key 长度不能超过 240 字符"));
     }
-    validate_cache_prefix(prefix)?;
-    if hashed_key.len() != 64 || !hashed_key.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(anyhow!("cache key 哈希段必须是 64 位十六进制 sha256"));
+    if raw.chars().any(|c| c.is_control()) {
+        return Err(anyhow!("cache key 不能包含控制字符"));
+    }
+    if raw.starts_with(':') || raw.ends_with(':') {
+        return Err(anyhow!("cache key 不能以 ':' 开头或结尾"));
     }
     Ok(())
 }
 
-fn validate_cache_prefix(prefix: &str) -> AnyResult<()> {
-    let raw = prefix.trim();
+fn normalize_runtime_cache_scope_id(input: &str) -> String {
+    let raw = input.trim();
     if raw.is_empty() {
-        return Err(anyhow!("cache 前缀不能为空"));
+        return "default-runtime".to_string();
     }
-    if raw.chars().count() > 200 {
-        return Err(anyhow!("cache key 前缀长度不能超过 200 字符"));
+
+    let mut out = String::with_capacity(raw.len().min(96));
+    for ch in raw.chars() {
+        if out.len() >= 96 {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '@') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
     }
-    if !raw.starts_with("plg_") {
-        return Err(anyhow!("cache 前缀必须以 plg_ 开头"));
+
+    if out.is_empty() {
+        "default-runtime".to_string()
+    } else {
+        out
     }
-    let digest = &raw[4..];
-    if digest.len() != 64 || !digest.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(anyhow!("cache 前缀哈希段必须是 64 位十六进制 sha256"));
-    }
-    Ok(())
+}
+
+fn qualify_cache_key(cache_scope_id: &str, key: &str) -> String {
+    format!("rid::{cache_scope_id}::{key}")
 }
 
 pub fn log_emit(level: String, message: String) -> String {
@@ -3047,7 +3069,7 @@ fn run_async_script_internal(
     script: &str,
     load_axios: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let runtime = crate::host_runtime::AsyncHostRuntime::new(load_axios)?;
+    let runtime = crate::host_runtime::AsyncHostRuntime::new(load_axios, "test-web-runtime")?;
     let task = runtime.spawn(script)?;
     task.wait().map_err(|e| e.into())
 }

@@ -1,7 +1,7 @@
-use rquickjs::{function::Func, Context, Function, Runtime};
+use rquickjs::{Context, Function, Runtime, function::Func};
 use serde::de::DeserializeOwned;
-use std::future::IntoFuture;
 use std::collections::HashMap;
+use std::future::IntoFuture;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -10,8 +10,8 @@ use std::thread;
 use tokio::sync::oneshot;
 
 use crate::web_runtime::{
-    http_request_drop_evented, http_request_start_evented, install_host_bindings,
-    wasi_run_drop_evented, wasi_run_start_evented, AXIOS_BUNDLE, WEB_POLYFILL,
+    AXIOS_BUNDLE, WEB_POLYFILL, http_request_drop_evented, http_request_start_evented,
+    install_host_bindings, wasi_run_drop_evented, wasi_run_start_evented,
 };
 
 #[cfg(feature = "host-fs")]
@@ -66,6 +66,7 @@ const ASYNC_TASK_DISPATCHER_JS: &str = r#"(function () {
 pub struct HostRuntime {
     runtime: Runtime,
     context: Context,
+    cache_scope_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +79,7 @@ pub struct RuntimeTaskStats {
 
 pub struct AsyncHostRuntime {
     runtime_id: u64,
+    cache_scope_id: String,
     tx: mpsc::Sender<WorkerSignal>,
     states: Arc<Mutex<HashMap<u64, TaskState>>>,
     waiters: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<String, String>>>>>,
@@ -105,10 +107,19 @@ enum AsyncCommand {
 }
 
 enum HostEvent {
-    HttpCompleted { id: u64, payload: String },
+    HttpCompleted {
+        id: u64,
+        payload: String,
+    },
     #[cfg(feature = "host-fs")]
-    FsCompleted { id: u64, payload: String },
-    WasiCompleted { id: u64, payload: String },
+    FsCompleted {
+        id: u64,
+        payload: String,
+    },
+    WasiCompleted {
+        id: u64,
+        payload: String,
+    },
 }
 
 enum WorkerSignal {
@@ -133,12 +144,12 @@ struct RuntimeShared {
 }
 
 impl HostRuntime {
-    pub fn new(load_axios: bool) -> Result<Self, rquickjs::Error> {
+    pub fn new(load_axios: bool, cache_scope_id: String) -> Result<Self, rquickjs::Error> {
         let runtime = Runtime::new()?;
         let context = Context::full(&runtime)?;
 
         context.with(|ctx| {
-            install_host_bindings(&ctx)?;
+            install_host_bindings(&ctx, &cache_scope_id)?;
             ctx.eval::<(), _>(WEB_POLYFILL)?;
             if load_axios && !AXIOS_BUNDLE.is_empty() {
                 ctx.eval::<(), _>(AXIOS_BUNDLE)?;
@@ -146,7 +157,11 @@ impl HostRuntime {
             Ok::<(), rquickjs::Error>(())
         })?;
 
-        Ok(Self { runtime, context })
+        Ok(Self {
+            runtime,
+            context,
+            cache_scope_id,
+        })
     }
 
     pub fn submit_async_task(
@@ -182,10 +197,16 @@ impl HostRuntime {
     ) -> Result<R, rquickjs::Error> {
         self.context.with(f)
     }
+
+    pub fn cache_scope_id(&self) -> &str {
+        &self.cache_scope_id
+    }
 }
 
 impl AsyncHostRuntime {
-    pub fn new(load_axios: bool) -> Result<Self, String> {
+    pub fn new(load_axios: bool, cache_scope_id: impl Into<String>) -> Result<Self, String> {
+        let cache_scope_id = cache_scope_id.into();
+        let cache_scope_id_for_worker = cache_scope_id.clone();
         let (tx, rx) = mpsc::channel::<WorkerSignal>();
         let tx_for_worker = tx.clone();
         let states = Arc::new(Mutex::new(HashMap::<u64, TaskState>::new()));
@@ -206,7 +227,7 @@ impl AsyncHostRuntime {
         let (init_tx, init_rx) = mpsc::channel::<Result<(), String>>();
 
         thread::spawn(move || {
-            let host = match HostRuntime::new(load_axios) {
+            let host = match HostRuntime::new(load_axios, cache_scope_id_for_worker) {
                 Ok(host) => host,
                 Err(err) => {
                     let _ = init_tx.send(Err(format!("初始化 HostRuntime 失败: {err}")));
@@ -280,6 +301,7 @@ impl AsyncHostRuntime {
         match init_rx.recv() {
             Ok(Ok(())) => Ok(Self {
                 runtime_id,
+                cache_scope_id,
                 tx,
                 states,
                 waiters,
@@ -343,7 +365,10 @@ impl AsyncHostRuntime {
         })
     }
 
-    pub fn spawn_json<T>(&self, script: impl Into<String>) -> Result<RuntimeJsonTaskHandle<T>, String>
+    pub fn spawn_json<T>(
+        &self,
+        script: impl Into<String>,
+    ) -> Result<RuntimeJsonTaskHandle<T>, String>
     where
         T: DeserializeOwned + Send + 'static,
     {
@@ -355,7 +380,11 @@ impl AsyncHostRuntime {
     }
 
     pub fn cancel(&self, id: u64) -> bool {
-        if self.tx.send(WorkerSignal::Command(AsyncCommand::Drop { id })).is_err() {
+        if self
+            .tx
+            .send(WorkerSignal::Command(AsyncCommand::Drop { id }))
+            .is_err()
+        {
             return false;
         }
         true
@@ -392,10 +421,19 @@ impl AsyncHostRuntime {
             dropped,
         }
     }
+
+    pub fn cache_scope_id(&self) -> &str {
+        &self.cache_scope_id
+    }
 }
 
 impl Drop for AsyncHostRuntime {
     fn drop(&mut self) {
+        fail_all_active_tasks(
+            &self.states,
+            &self.waiters,
+            "等待任务结果失败: runtime 已关闭".to_string(),
+        );
         let _ = self.tx.send(WorkerSignal::Command(AsyncCommand::Shutdown));
         unregister_runtime_shared(self.runtime_id);
     }
@@ -505,7 +543,8 @@ where
     T: DeserializeOwned + Send + 'static,
 {
     type Output = Result<T, String>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, String>> + Send>>;
+    type IntoFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, String>> + Send>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.wait_async().await })
@@ -600,7 +639,10 @@ fn install_evented_host_bindings_worker(
             },
         )?,
     )?;
-    globals.set("__http_request_drop_evented", Func::from(http_request_drop_evented))?;
+    globals.set(
+        "__http_request_drop_evented",
+        Func::from(http_request_drop_evented),
+    )?;
 
     #[cfg(feature = "host-fs")]
     {
@@ -610,7 +652,10 @@ fn install_evented_host_bindings_worker(
             Function::new(ctx.clone(), move |op: String, args_json: String| {
                 let tx = fs_tx.clone();
                 fs_task_start_evented(op, args_json, move |id, payload| {
-                    let _ = tx.send(WorkerSignal::HostEvent(HostEvent::FsCompleted { id, payload }));
+                    let _ = tx.send(WorkerSignal::HostEvent(HostEvent::FsCompleted {
+                        id,
+                        payload,
+                    }));
                 })
             })?,
         )?;
@@ -655,9 +700,7 @@ fn handle_worker_signal(
     waiters: &Arc<Mutex<HashMap<u64, oneshot::Sender<Result<String, String>>>>>,
 ) -> bool {
     match signal {
-        WorkerSignal::Command(cmd) => {
-            handle_worker_command(cmd, host, runtime_id, states, waiters)
-        }
+        WorkerSignal::Command(cmd) => handle_worker_command(cmd, host, runtime_id, states, waiters),
         WorkerSignal::HostEvent(event) => {
             handle_host_event(host, event);
             true
@@ -697,7 +740,10 @@ fn handle_host_event(host: &HostRuntime, event: HostEvent) {
     let _ = result;
 }
 
-fn handle_host_event_in_ctx(ctx: rquickjs::Ctx<'_>, event: HostEvent) -> Result<(), rquickjs::Error> {
+fn handle_host_event_in_ctx(
+    ctx: rquickjs::Ctx<'_>,
+    event: HostEvent,
+) -> Result<(), rquickjs::Error> {
     let globals = ctx.globals();
     match event {
         HostEvent::HttpCompleted { id, payload } => {
@@ -841,7 +887,10 @@ fn is_task_active(states: &Arc<Mutex<HashMap<u64, TaskState>>>, id: u64) -> bool
         return false;
     };
 
-    matches!(guard.get(&id), Some(TaskState::Pending | TaskState::Running))
+    matches!(
+        guard.get(&id),
+        Some(TaskState::Pending | TaskState::Running)
+    )
 }
 
 fn mark_running_if_available(states: &Arc<Mutex<HashMap<u64, TaskState>>>, id: u64) -> bool {

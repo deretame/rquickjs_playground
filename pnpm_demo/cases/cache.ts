@@ -7,30 +7,36 @@ export default async function main() {
   }
 
   const cache = requireApi("cache");
-  const pluginCache = cache.scoped("caseCache");
+  const withScope = (key: string) => `caseCache::${key}`;
 
-    const numKey = "num";
-    const lockKey = "lock";
+    const numKey = withScope("num");
+    const lockKey = withScope("lock");
+    const tempAKey = withScope("tempA");
+    const tempBKey = withScope("tempB");
 
-    pluginCache.delete(numKey);
-    pluginCache.delete(lockKey);
-    pluginCache.clearAll();
-    pluginCache.set(numKey, 1);
-    const n1 = pluginCache.get(numKey);
-    const insertedA = pluginCache.setIfAbsent(lockKey, { v: 1 });
-    const insertedB = pluginCache.setIfAbsent(lockKey, { v: 2 });
-    const casFail = pluginCache.compareAndSet(lockKey, { v: 2 }, { v: 3 });
-    const casOk = pluginCache.compareAndSet(lockKey, { v: 1 }, { v: 3 });
-    const lockV = pluginCache.get<{ v: number }>(lockKey, { v: -1 });
-    const hasNum = pluginCache.has(numKey);
-    const deleted = pluginCache.delete(numKey);
-    const n2 = pluginCache.get(numKey, -1);
+    cache.delete(numKey);
+    cache.delete(lockKey);
+    cache.delete(tempAKey);
+    cache.delete(tempBKey);
+    cache.set(numKey, 1);
+    const n1 = cache.get(numKey);
+    const insertedA = cache.setIfAbsent(lockKey, { v: 1 });
+    const insertedB = cache.setIfAbsent(lockKey, { v: 2 });
+    const casFail = cache.compareAndSet(lockKey, { v: 2 }, { v: 3 });
+    const casOk = cache.compareAndSet(lockKey, { v: 1 }, { v: 3 });
+    const lockV = cache.get<{ v: number }>(lockKey, { v: -1 });
+    const hasNum = cache.has(numKey);
+    const deleted = cache.delete(numKey);
+    const n2 = cache.get(numKey, -1);
     const hasClear = typeof (cache as { clear?: unknown }).clear === "function";
-    pluginCache.set("tempA", 1);
-    pluginCache.set("tempB", 2);
-    const cleared = pluginCache.clearAll();
-    const hasTempA = pluginCache.has("tempA");
-    const hasTempB = pluginCache.has("tempB");
+    cache.set(tempAKey, 1);
+    cache.set(tempBKey, 2);
+    const hasTempA_beforeDelete = cache.has(tempAKey);
+    const hasTempB_beforeDelete = cache.has(tempBKey);
+    cache.delete(tempAKey);
+    cache.delete(tempBKey);
+    const hasTempA = cache.has(tempAKey);
+    const hasTempB = cache.has(tempBKey);
 
   return {
     ok:
@@ -44,7 +50,8 @@ export default async function main() {
       && deleted === true
       && n2 === -1
       && hasClear === false
-      && cleared >= 2
+      && hasTempA_beforeDelete === true
+      && hasTempB_beforeDelete === true
       && hasTempA === false
       && hasTempB === false,
   };

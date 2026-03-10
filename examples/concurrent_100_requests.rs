@@ -65,7 +65,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let rust_start = Instant::now();
     let raw = tokio::task::spawn_blocking(move || {
-        let host = AsyncHostRuntime::new(false).expect("创建 HostRuntime 失败");
+        let host =
+            AsyncHostRuntime::new(false, "example-concurrent-requests").expect("创建 HostRuntime 失败");
         host.spawn(&script).expect("执行 JS 脚本失败").wait()
     })
     .await??;

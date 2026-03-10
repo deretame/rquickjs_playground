@@ -58,7 +58,8 @@ impl PluginManager {
             workers.push(tx);
 
             thread::spawn(move || {
-                let host = AsyncHostRuntime::new(false).expect("创建 HostRuntime 失败");
+                let host = AsyncHostRuntime::new(false, format!("example-tokio-plugin-worker-{worker_id}"))
+                    .expect("创建 HostRuntime 失败");
                 host.spawn(plugin_bootstrap_script())
                     .expect("初始化插件脚本失败")
                     .wait()

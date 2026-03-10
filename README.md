@@ -24,15 +24,19 @@ rquickjs_playground = { path = "../rquickjs_playground" }
 最小示例：
 
 ```rust
-use rquickjs_playground::HostRuntime;
+use rquickjs_playground::AsyncHostRuntime;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let host = HostRuntime::new(true)?;
-    let output = host.eval_async("(async () => JSON.stringify({ ok: true }))()")?;
+    let host = AsyncHostRuntime::new(true, "demo-runtime")?;
+    let output = host
+        .spawn("(async () => JSON.stringify({ ok: true }))()")?
+        .wait()?;
     println!("{output}");
     Ok(())
 }
 ```
+
+说明：`AsyncHostRuntime::new(load_axios, cache_scope_id)` 的第二个参数是实例级缓存作用域 id。宿主会在 Rust 侧自动把 cache key 前缀化，不需要在 JS 里手动拼接 runtime id。
 
 如果你想运行仓库里的演示：
 
@@ -462,3 +466,5 @@ const id = runtime.uuidv4();
 - Runtime API：`crypto/nodeCryptoCompat`、`uuidv4`、`Buffer`、`TextEncoder/TextDecoder`
 
 并且提供了 `getApi(name)`（可选）与 `requireApi(name)`（缺失直接抛错）两套调用方式。
+
+补充：当前 `cache` API 不再提供 `cache.scoped(...)`。如果需要业务内分组，请直接在 key 上自行加前缀（例如 `"jm_http::jwt"`）。实例级隔离由 `AsyncHostRuntime::new(..., cache_scope_id)` 在 Rust 侧统一处理。
