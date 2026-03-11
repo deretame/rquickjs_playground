@@ -1,5 +1,6 @@
 use rquickjs::{Context, Function, Runtime, function::Func};
 use serde::de::DeserializeOwned;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::future::IntoFuture;
 use std::marker::PhantomData;
@@ -62,6 +63,118 @@ const ASYNC_TASK_DISPATCHER_JS: &str = r#"(function () {
     );
   };
 })();"#;
+
+const BUNDLE_DISPATCHER_JS: &str = r#"(async () => {
+  try {
+    if (globalThis.__host_bundle_runtime && typeof globalThis.__host_bundle_runtime.invoke === "function") {
+      return JSON.stringify({ ok: true, data: null });
+    }
+
+    const REGISTRY_KEY = "__host_bundle_registry";
+
+    const ensureRegistry = () => {
+      let registry = globalThis[REGISTRY_KEY];
+      if (!(registry instanceof Map)) {
+        registry = new Map();
+        globalThis[REGISTRY_KEY] = registry;
+      }
+      return registry;
+    };
+
+    const normalizeApi = (api) => {
+      let out = api;
+      if (out && typeof out === "object" && out.default !== undefined) {
+        out = out.default;
+      }
+      if (!out || (typeof out !== "object" && typeof out !== "function")) {
+        throw new TypeError("bundle must export object or function");
+      }
+      return out;
+    };
+
+    const isSafeKey = (k) => k !== "__proto__" && k !== "prototype" && k !== "constructor";
+
+    const resolveCallable = (api, fnPath) => {
+      const parts = String(fnPath).split(".").filter(Boolean);
+      if (parts.length === 0) {
+        throw new TypeError("function path is empty");
+      }
+
+      let owner = api;
+      for (let i = 0; i < parts.length - 1; i++) {
+        const key = parts[i];
+        if (!isSafeKey(key)) throw new TypeError(`unsafe path segment: ${key}`);
+        owner = owner?.[key];
+        if (owner === undefined || owner === null) {
+          throw new Error(`function path not found: ${fnPath}`);
+        }
+      }
+
+      const leaf = parts[parts.length - 1];
+      if (!isSafeKey(leaf)) throw new TypeError(`unsafe path segment: ${leaf}`);
+      const fn = owner?.[leaf];
+      if (typeof fn !== "function") {
+        throw new TypeError(`target is not function: ${fnPath}`);
+      }
+
+      return { owner, fn };
+    };
+
+    globalThis.__host_bundle_runtime = {
+      loadBundle(name, source) {
+        const registry = ensureRegistry();
+        const module = { exports: {} };
+        const exports = module.exports;
+        const requireFn = typeof require === "function" ? require.bind(globalThis) : undefined;
+        const runner = new Function("module", "exports", "require", source);
+        runner(module, exports, requireFn);
+        registry.set(String(name), normalizeApi(module.exports));
+      },
+      async invoke(payload) {
+        const registry = ensureRegistry();
+        const name = String(payload?.name || "");
+        const fnPath = String(payload?.fnPath || "");
+        const args = Array.isArray(payload?.args) ? payload.args : [];
+
+        const api = registry.get(name);
+        if (!api) {
+          throw new Error(`bundle not found: ${name}`);
+        }
+
+        const { owner, fn } = resolveCallable(api, fnPath);
+        return await fn.apply(owner, args);
+      },
+      unloadBundle(name) {
+        const registry = ensureRegistry();
+        return registry.delete(String(name));
+      },
+      listBundles() {
+        const registry = ensureRegistry();
+        return Array.from(registry.keys()).map((v) => String(v));
+      },
+      async callOnce(payload) {
+        const source = String(payload?.source || "");
+        const fnPath = String(payload?.fnPath || "");
+        const args = Array.isArray(payload?.args) ? payload.args : [];
+
+        const module = { exports: {} };
+        const exports = module.exports;
+        const requireFn = typeof require === "function" ? require.bind(globalThis) : undefined;
+        const runner = new Function("module", "exports", "require", source);
+        runner(module, exports, requireFn);
+
+        const api = normalizeApi(module.exports);
+        const { owner, fn } = resolveCallable(api, fnPath);
+        return await fn.apply(owner, args);
+      },
+    };
+
+    return JSON.stringify({ ok: true, data: null });
+  } catch (err) {
+    const message = String(err && (err.stack || err.message) ? (err.stack || err.message) : err);
+    return JSON.stringify({ ok: false, error: message });
+  }
+})()"#;
 
 pub struct HostRuntime {
     runtime: Runtime,
@@ -425,6 +538,209 @@ impl AsyncHostRuntime {
     pub fn cache_scope_id(&self) -> &str {
         &self.cache_scope_id
     }
+
+    pub async fn bundle_load(&self, name: &str, source: &str) -> Result<(), String> {
+        self.bundle_ensure_dispatcher().await?;
+        let name_literal = serde_json::to_string(name)
+            .map_err(|e| format!("序列化 bundle 名称失败: {e}"))?;
+        let source_literal = serde_json::to_string(source)
+            .map_err(|e| format!("序列化 bundle 脚本失败: {e}"))?;
+
+        let script = format!(
+            r#"
+            (async () => {{
+              try {{
+                const host = globalThis.__host_bundle_runtime;
+                if (!host || typeof host.loadBundle !== "function") {{
+                  throw new Error("bundle dispatcher unavailable");
+                }}
+                host.loadBundle({name_literal}, {source_literal});
+                return JSON.stringify({{ ok: true, data: null }});
+              }} catch (err) {{
+                const message = String(err && (err.stack || err.message) ? (err.stack || err.message) : err);
+                return JSON.stringify({{ ok: false, error: message }});
+              }}
+            }})()
+            "#
+        );
+
+        let raw = self
+            .spawn(script)
+            .map_err(|e| format!("加载 bundle 失败: {e}"))?
+            .wait_async()
+            .await
+            .map_err(|e| format!("加载 bundle 失败: {e}"))?;
+        let _ = parse_ok_json_payload(&raw)?;
+        Ok(())
+    }
+
+    pub async fn bundle_call(
+        &self,
+        name: &str,
+        fn_path: &str,
+        args: &Value,
+    ) -> Result<Value, String> {
+        self.bundle_ensure_dispatcher().await?;
+        if !args.is_array() {
+            return Err("调用参数必须是 JSON 数组".to_string());
+        }
+
+        let name_literal = serde_json::to_string(name)
+            .map_err(|e| format!("序列化 bundle 名称失败: {e}"))?;
+        let fn_path_literal =
+            serde_json::to_string(fn_path).map_err(|e| format!("序列化函数路径失败: {e}"))?;
+        let args_literal =
+            serde_json::to_string(args).map_err(|e| format!("序列化调用参数失败: {e}"))?;
+
+        let script = format!(
+            r#"
+            (async () => {{
+              try {{
+                const host = globalThis.__host_bundle_runtime;
+                if (!host || typeof host.invoke !== "function") {{
+                  throw new Error("bundle dispatcher unavailable");
+                }}
+                const data = await host.invoke({{ name: {name_literal}, fnPath: {fn_path_literal}, args: {args_literal} }});
+                return JSON.stringify({{ ok: true, data }});
+              }} catch (err) {{
+                const message = String(err && (err.stack || err.message) ? (err.stack || err.message) : err);
+                return JSON.stringify({{ ok: false, error: message }});
+              }}
+            }})()
+            "#
+        );
+
+        let raw = self
+            .spawn(script)
+            .map_err(|e| format!("执行 bundle 函数失败: {e}"))?
+            .wait_async()
+            .await
+            .map_err(|e| format!("执行 bundle 函数失败: {e}"))?;
+        parse_ok_json_payload(&raw)
+    }
+
+    pub async fn bundle_call_once(
+        &self,
+        source: &str,
+        fn_path: &str,
+        args: &Value,
+    ) -> Result<Value, String> {
+        self.bundle_ensure_dispatcher().await?;
+        if !args.is_array() {
+            return Err("调用参数必须是 JSON 数组".to_string());
+        }
+
+        let source_literal = serde_json::to_string(source)
+            .map_err(|e| format!("序列化 bundle 脚本失败: {e}"))?;
+        let fn_path_literal =
+            serde_json::to_string(fn_path).map_err(|e| format!("序列化函数路径失败: {e}"))?;
+        let args_literal =
+            serde_json::to_string(args).map_err(|e| format!("序列化调用参数失败: {e}"))?;
+
+        let script = format!(
+            r#"
+            (async () => {{
+              try {{
+                const host = globalThis.__host_bundle_runtime;
+                if (!host || typeof host.callOnce !== "function") {{
+                  throw new Error("bundle dispatcher unavailable");
+                }}
+                const data = await host.callOnce({{ source: {source_literal}, fnPath: {fn_path_literal}, args: {args_literal} }});
+                return JSON.stringify({{ ok: true, data }});
+              }} catch (err) {{
+                const message = String(err && (err.stack || err.message) ? (err.stack || err.message) : err);
+                return JSON.stringify({{ ok: false, error: message }});
+              }}
+            }})()
+            "#
+        );
+
+        let raw = self
+            .spawn(script)
+            .map_err(|e| format!("执行一次性 bundle 调用失败: {e}"))?
+            .wait_async()
+            .await
+            .map_err(|e| format!("执行一次性 bundle 调用失败: {e}"))?;
+        parse_ok_json_payload(&raw)
+    }
+
+    pub async fn bundle_unload(&self, name: &str) -> Result<bool, String> {
+        self.bundle_ensure_dispatcher().await?;
+        let name_literal = serde_json::to_string(name)
+            .map_err(|e| format!("序列化 bundle 名称失败: {e}"))?;
+
+        let script = format!(
+            r#"
+            (async () => {{
+              try {{
+                const host = globalThis.__host_bundle_runtime;
+                if (!host || typeof host.unloadBundle !== "function") {{
+                  throw new Error("bundle dispatcher unavailable");
+                }}
+                const removed = host.unloadBundle({name_literal});
+                return JSON.stringify({{ ok: true, data: removed }});
+              }} catch (err) {{
+                const message = String(err && (err.stack || err.message) ? (err.stack || err.message) : err);
+                return JSON.stringify({{ ok: false, error: message }});
+              }}
+            }})()
+            "#
+        );
+
+        let raw = self
+            .spawn(script)
+            .map_err(|e| format!("卸载 bundle 失败: {e}"))?
+            .wait_async()
+            .await
+            .map_err(|e| format!("卸载 bundle 失败: {e}"))?;
+        let data = parse_ok_json_payload(&raw)?;
+        Ok(data.as_bool().unwrap_or(false))
+    }
+
+    pub async fn bundle_list(&self) -> Result<Vec<String>, String> {
+        self.bundle_ensure_dispatcher().await?;
+        let script = r#"
+            (async () => {
+              try {
+                const host = globalThis.__host_bundle_runtime;
+                if (!host || typeof host.listBundles !== "function") {
+                  throw new Error("bundle dispatcher unavailable");
+                }
+                const names = host.listBundles();
+                return JSON.stringify({ ok: true, data: names });
+              } catch (err) {
+                const message = String(err && (err.stack || err.message) ? (err.stack || err.message) : err);
+                return JSON.stringify({ ok: false, error: message });
+              }
+            })()
+        "#;
+
+        let raw = self
+            .spawn(script)
+            .map_err(|e| format!("读取 bundle 列表失败: {e}"))?
+            .wait_async()
+            .await
+            .map_err(|e| format!("读取 bundle 列表失败: {e}"))?;
+        let data = parse_ok_json_payload(&raw)?;
+        let arr = data
+            .as_array()
+            .ok_or_else(|| "读取 bundle 列表失败: 返回值不是数组".to_string())?;
+        Ok(arr
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default().to_string())
+            .collect())
+    }
+
+    async fn bundle_ensure_dispatcher(&self) -> Result<(), String> {
+        let raw = self
+            .spawn(BUNDLE_DISPATCHER_JS)
+            .map_err(|e| format!("初始化 bundle dispatcher 失败: {e}"))?
+            .wait_async()
+            .await
+            .map_err(|e| format!("初始化 bundle dispatcher 失败: {e}"))?;
+        let _ = parse_ok_json_payload(&raw)?;
+        Ok(())
+    }
 }
 
 impl Drop for AsyncHostRuntime {
@@ -559,6 +875,20 @@ where
         Ok(payload) => serde_json::from_str(&payload)
             .map_err(|e| format!("解析 JSON 任务结果失败: {e}; payload={payload}")),
         Err(err) => Err(err),
+    }
+}
+
+fn parse_ok_json_payload(raw: &str) -> Result<Value, String> {
+    let payload: Value =
+        serde_json::from_str(raw).map_err(|e| format!("解析 JS 返回 JSON 失败: {e}"))?;
+    if payload.get("ok").and_then(Value::as_bool) == Some(true) {
+        Ok(payload.get("data").cloned().unwrap_or(Value::Null))
+    } else {
+        Err(payload
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("执行失败")
+            .to_string())
     }
 }
 
