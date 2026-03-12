@@ -580,43 +580,29 @@ impl AsyncHostRuntime {
         fn_path: &str,
         args: &Value,
     ) -> Result<Value, String> {
+        let raw = self
+            .bundle_call_start(name, fn_path, args)
+            .await?
+            .wait_async()
+            .await
+            .map_err(|e| format!("执行 bundle 函数失败: {e}"))?;
+        parse_ok_json_payload(&raw)
+    }
+
+    pub async fn bundle_call_start(
+        &self,
+        name: &str,
+        fn_path: &str,
+        args: &Value,
+    ) -> Result<RuntimeTaskHandle, String> {
         self.bundle_ensure_dispatcher().await?;
         if !args.is_array() {
             return Err("调用参数必须是 JSON 数组".to_string());
         }
 
-        let name_literal = serde_json::to_string(name)
-            .map_err(|e| format!("序列化 bundle 名称失败: {e}"))?;
-        let fn_path_literal =
-            serde_json::to_string(fn_path).map_err(|e| format!("序列化函数路径失败: {e}"))?;
-        let args_literal =
-            serde_json::to_string(args).map_err(|e| format!("序列化调用参数失败: {e}"))?;
-
-        let script = format!(
-            r#"
-            (async () => {{
-              try {{
-                const host = globalThis.__host_bundle_runtime;
-                if (!host || typeof host.invoke !== "function") {{
-                  throw new Error("bundle dispatcher unavailable");
-                }}
-                const data = await host.invoke({{ name: {name_literal}, fnPath: {fn_path_literal}, args: {args_literal} }});
-                return JSON.stringify({{ ok: true, data }});
-              }} catch (err) {{
-                const message = String(err && (err.stack || err.message) ? (err.stack || err.message) : err);
-                return JSON.stringify({{ ok: false, error: message }});
-              }}
-            }})()
-            "#
-        );
-
-        let raw = self
-            .spawn(script)
-            .map_err(|e| format!("执行 bundle 函数失败: {e}"))?
-            .wait_async()
-            .await
-            .map_err(|e| format!("执行 bundle 函数失败: {e}"))?;
-        parse_ok_json_payload(&raw)
+        let script = build_bundle_call_script(name, fn_path, args)?;
+        self.spawn(script)
+            .map_err(|e| format!("提交 bundle 调用任务失败: {e}"))
     }
 
     pub async fn bundle_call_once(
@@ -890,6 +876,33 @@ fn parse_ok_json_payload(raw: &str) -> Result<Value, String> {
             .unwrap_or("执行失败")
             .to_string())
     }
+}
+
+fn build_bundle_call_script(name: &str, fn_path: &str, args: &Value) -> Result<String, String> {
+    let name_literal =
+        serde_json::to_string(name).map_err(|e| format!("序列化 bundle 名称失败: {e}"))?;
+    let fn_path_literal =
+        serde_json::to_string(fn_path).map_err(|e| format!("序列化函数路径失败: {e}"))?;
+    let args_literal =
+        serde_json::to_string(args).map_err(|e| format!("序列化调用参数失败: {e}"))?;
+
+    Ok(format!(
+        r#"
+        (async () => {{
+          try {{
+            const host = globalThis.__host_bundle_runtime;
+            if (!host || typeof host.invoke !== "function") {{
+              throw new Error("bundle dispatcher unavailable");
+            }}
+            const data = await host.invoke({{ name: {name_literal}, fnPath: {fn_path_literal}, args: {args_literal} }});
+            return JSON.stringify({{ ok: true, data }});
+          }} catch (err) {{
+            const message = String(err && (err.stack || err.message) ? (err.stack || err.message) : err);
+            return JSON.stringify({{ ok: false, error: message }});
+          }}
+        }})()
+        "#
+    ))
 }
 
 fn async_runtime_shared() -> &'static Mutex<HashMap<u64, Arc<RuntimeShared>>> {
