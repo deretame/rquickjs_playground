@@ -56,7 +56,16 @@ export interface CacheApi {
 export interface BridgeApi {
   call(name: "crypto.md5_hex", input: string): Promise<string>;
   call(name: "crypto.aes_ecb_pkcs7_decrypt_b64", payloadB64: string, keyRaw: string): Promise<string>;
+  call(name: "flush_persistent_store", key: string, value: string): Promise<string>;
+  call(name: "load_persistent_store", key: string, value: string): Promise<string>;
+  call(name: "persistent.flush_persistent_store", key: string, value: string): Promise<string>;
+  call(name: "persistent.load_persistent_store", key: string, value: string): Promise<string>;
   call(name: string, ...args: unknown[]): Promise<unknown>;
+}
+
+export interface PersistentStoreApi {
+  flushPersistentStore(key: string, value: string): Promise<string>;
+  loadPersistentStore(key: string, value: string): Promise<string>;
 }
 
 export interface CryptoHash {
@@ -100,6 +109,7 @@ declare global {
   var wasi: WasiApi | undefined;
   var cache: CacheApi | undefined;
   var bridge: BridgeApi | undefined;
+  var persistentStore: PersistentStoreApi | undefined;
   var nodeCryptoCompat: CryptoApi | undefined;
   var uuidv4: (() => string) | undefined;
 }

@@ -6,6 +6,7 @@ import type {
   FsApi,
   NativeApi,
   PathApi,
+  PersistentStoreApi,
   PluginApi,
   WasiApi,
 } from "../types/runtime-globals";
@@ -24,6 +25,7 @@ export interface RuntimeApiSet {
   wasi: WasiApi;
   cache: CacheApi;
   bridge: BridgeApi;
+  persistentStore: PersistentStoreApi;
   plugin: PluginApi;
   path: PathApi;
   URL: typeof URL;
@@ -105,6 +107,7 @@ export function getRuntimeApis(): Partial<RuntimeApiSet> {
     wasi: getApi("wasi"),
     cache: getApi("cache"),
     bridge: getApi("bridge"),
+    persistentStore: getApi("persistentStore"),
     plugin: getApi("plugin"),
     path: getApi("path"),
     URL: getApi("URL"),
@@ -137,6 +140,7 @@ export const runtime = {
   get wasi() { return requireApi("wasi"); },
   get cache() { return requireApi("cache"); },
   get bridge() { return requireApi("bridge"); },
+  get persistentStore() { return requireApi("persistentStore"); },
   get plugin() { return requireApi("plugin"); },
   get path() { return requireApi("path"); },
   get URL() { return requireApi("URL"); },

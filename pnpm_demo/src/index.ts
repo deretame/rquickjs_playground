@@ -5,11 +5,30 @@ export default async function main() {
     : (...parts: string[]) => parts.join("/").replace(/\/+/g, "/").replace("/images/../", "/");
   const joined = joinPath("/demo", "images", "..", "out.png");
 
+  const persistentStoreApi = (globalThis as unknown as {
+    persistentStore?: {
+      flushPersistentStore?: (key: string, value: string) => Promise<string>;
+      loadPersistentStore?: (key: string, value: string) => Promise<string>;
+    };
+  }).persistentStore;
+
+  let persistentStoreExample: unknown = null;
+  if (
+    persistentStoreApi
+    && typeof persistentStoreApi.flushPersistentStore === "function"
+    && typeof persistentStoreApi.loadPersistentStore === "function"
+  ) {
+    await persistentStoreApi.flushPersistentStore("demo.token", "abc123");
+    const loaded = await persistentStoreApi.loadPersistentStore("demo.token", "");
+    persistentStoreExample = { key: "demo.token", loadedRaw: loaded };
+  }
+
   if (!globalThis.native || !globalThis.wasi) {
     return {
       ok: true,
       runtime: "node",
       joined,
+      persistentStoreExample,
       note: "native/wasi 不存在，走 Node 回退路径",
     };
   }
@@ -33,6 +52,7 @@ export default async function main() {
   return {
     ok: true,
     joined,
+    persistentStoreExample,
     out: Array.from(out),
     wasi: {
       exitCode: run.exitCode,

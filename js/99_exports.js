@@ -14,6 +14,7 @@
     cache,
     console,
     bridge,
+    persistentStore,
     plugin,
     URL,
     URLSearchParams,
@@ -41,6 +42,7 @@
   globalThis.cache = cache;
   globalThis.console = console;
   globalThis.bridge = bridge;
+  globalThis.persistentStore = persistentStore;
   globalThis.plugin = plugin;
   globalThis.URL = URL;
   globalThis.URLSearchParams = URLSearchParams;

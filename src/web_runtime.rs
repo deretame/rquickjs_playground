@@ -8,7 +8,6 @@ use serde_json::Map;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::env;
 use std::fs;
 use std::io;
 use std::io::Write;
@@ -114,7 +113,16 @@ pub fn install_host_bindings(ctx: &Ctx<'_>, cache_scope_id: &str) -> Result<(), 
     globals.set("__native_buffer_free", Func::from(native_buffer_free))?;
     globals.set("__native_exec", Func::from(native_exec))?;
     globals.set("__native_exec_chain", Func::from(native_exec_chain))?;
-    globals.set("__host_call", Func::from(host_call))?;
+    let cache_scope_for_host_call = cache_scope_id.clone();
+    globals.set(
+        "__host_call",
+        Function::new(
+            ctx.clone(),
+            move |name: String, args_json: Option<String>| {
+                host_call(cache_scope_for_host_call.clone(), name, args_json)
+            },
+        )?,
+    )?;
     globals.set("__wasi_run_start", Func::from(wasi_run_start))?;
     globals.set("__wasi_run_try_take", Func::from(wasi_run_try_take))?;
     globals.set("__wasi_run_drop", Func::from(wasi_run_drop))?;
@@ -213,6 +221,7 @@ static WASI_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 static WASI_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 static WASI_CACHE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 static HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
+static HTTP_CLIENT_CONFIG: OnceLock<Mutex<HttpClientConfig>> = OnceLock::new();
 static HOST_ASYNC_RT: OnceLock<TokioRuntime> = OnceLock::new();
 static HTTP_IO_SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static FS_IO_SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
@@ -227,6 +236,11 @@ static LOG_WRITTEN: AtomicU64 = AtomicU64::new(0);
 static LOG_DROPPED: AtomicU64 = AtomicU64::new(0);
 static LOG_ERRORS: AtomicU64 = AtomicU64::new(0);
 static LOG_PENDING: AtomicU64 = AtomicU64::new(0);
+type PersistentStoreHandler = Arc<dyn Fn(String, String, String) -> AnyResult<String> + Send + Sync + 'static>;
+static FLUSH_PERSISTENT_STORE_HANDLER: OnceLock<Mutex<Option<PersistentStoreHandler>>> =
+    OnceLock::new();
+static LOAD_PERSISTENT_STORE_HANDLER: OnceLock<Mutex<Option<PersistentStoreHandler>>> =
+    OnceLock::new();
 
 struct PendingTask {
     rx: mpsc::Receiver<String>,
@@ -237,6 +251,27 @@ struct PendingTask {
 struct PendingAbortTask {
     task: JoinHandle<()>,
     created_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+pub struct HttpClientConfig {
+    pub use_http_proxy: bool,
+    pub use_socks5_proxy: bool,
+    pub http_proxy: Option<String>,
+    pub socks5_proxy: Option<String>,
+    pub disable_tls_verify: bool,
+}
+
+impl Default for HttpClientConfig {
+    fn default() -> Self {
+        Self {
+            use_http_proxy: true,
+            use_socks5_proxy: true,
+            http_proxy: None,
+            socks5_proxy: None,
+            disable_tls_verify: false,
+        }
+    }
 }
 
 enum CacheCommand {
@@ -274,6 +309,58 @@ struct LogEvent {
 
 fn http_req_pool() -> &'static Mutex<HashMap<u64, PendingTask>> {
     HTTP_REQ_POOL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn flush_persistent_store_handler_cell() -> &'static Mutex<Option<PersistentStoreHandler>> {
+    FLUSH_PERSISTENT_STORE_HANDLER.get_or_init(|| Mutex::new(None))
+}
+
+fn load_persistent_store_handler_cell() -> &'static Mutex<Option<PersistentStoreHandler>> {
+    LOAD_PERSISTENT_STORE_HANDLER.get_or_init(|| Mutex::new(None))
+}
+
+pub fn register_flush_persistent_store_handler<F>(handler: F)
+where
+    F: Fn(String, String, String) -> AnyResult<String> + Send + Sync + 'static,
+{
+    if let Ok(mut guard) = flush_persistent_store_handler_cell().lock() {
+        *guard = Some(Arc::new(handler));
+    }
+}
+
+pub fn register_load_persistent_store_handler<F>(handler: F)
+where
+    F: Fn(String, String, String) -> AnyResult<String> + Send + Sync + 'static,
+{
+    if let Ok(mut guard) = load_persistent_store_handler_cell().lock() {
+        *guard = Some(Arc::new(handler));
+    }
+}
+
+fn call_registered_flush_persistent_store(
+    runtime_name: String,
+    key: String,
+    value: String,
+) -> AnyResult<String> {
+    let handler = flush_persistent_store_handler_cell()
+        .lock()
+        .map_err(|_| anyhow!("flush_persistent_store 回调锁已损坏"))?
+        .clone()
+        .ok_or_else(|| anyhow!("flush_persistent_store 回调未注册"))?;
+    handler(runtime_name, key, value)
+}
+
+fn call_registered_load_persistent_store(
+    runtime_name: String,
+    key: String,
+    value: String,
+) -> AnyResult<String> {
+    let handler = load_persistent_store_handler_cell()
+        .lock()
+        .map_err(|_| anyhow!("load_persistent_store 回调锁已损坏"))?
+        .clone()
+        .ok_or_else(|| anyhow!("load_persistent_store 回调未注册"))?;
+    handler(runtime_name, key, value)
 }
 
 fn http_req_event_pool() -> &'static Mutex<HashMap<u64, PendingAbortTask>> {
@@ -767,16 +854,85 @@ fn host_async_runtime() -> &'static TokioRuntime {
     })
 }
 
+fn http_client_config_cell() -> &'static Mutex<HttpClientConfig> {
+    HTTP_CLIENT_CONFIG.get_or_init(|| Mutex::new(HttpClientConfig::default()))
+}
+
+pub fn configure_http_client(config: HttpClientConfig) -> AnyResult<()> {
+    if HTTP_CLIENT.get().is_some() {
+        return Err(anyhow!(
+            "HTTP client 已初始化，无法更新配置；请在首次请求前配置或重启进程"
+        ));
+    }
+    let mut guard = http_client_config_cell()
+        .lock()
+        .map_err(|_| anyhow!("HTTP client 配置锁已损坏"))?;
+    *guard = config;
+    Ok(())
+}
+
+pub fn current_http_client_config() -> HttpClientConfig {
+    http_client_config_cell()
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default()
+}
+
+fn normalize_http_proxy_url(raw: &str) -> String {
+    let value = raw.trim();
+    if value.contains("://") {
+        return value.to_string();
+    }
+    format!("http://{value}")
+}
+
+fn normalize_socks5_proxy_url(raw: &str) -> String {
+    let value = raw.trim();
+    if value.contains("://") {
+        return value.to_string();
+    }
+    format!("socks5h://{value}")
+}
+
 fn http_client() -> AnyResult<&'static Client> {
     if let Some(client) = HTTP_CLIENT.get() {
         return Ok(client);
     }
 
     let mut builder = Client::builder().timeout(Duration::from_secs(30));
-    if let Some(proxy_url) = socks5_proxy_from_env() {
-        let proxy = Proxy::all(&proxy_url)
-            .with_context(|| format!("解析 socks5 代理地址失败: {proxy_url}"))?;
-        builder = builder.proxy(proxy);
+
+    let config = current_http_client_config();
+    if config.use_http_proxy {
+        if let Some(proxy_raw) = config.http_proxy.as_deref() {
+            let proxy_url = normalize_http_proxy_url(proxy_raw);
+            let proxy = Proxy::all(&proxy_url)
+                .with_context(|| format!("解析 HTTP 代理地址失败: {proxy_url}"))?;
+            builder = builder.proxy(proxy);
+        } else if config.use_socks5_proxy {
+            if let Some(proxy_raw) = config.socks5_proxy.as_deref() {
+                let proxy_url = normalize_socks5_proxy_url(proxy_raw);
+                let proxy = Proxy::all(&proxy_url)
+                    .with_context(|| format!("解析 socks5 代理地址失败: {proxy_url}"))?;
+                builder = builder.proxy(proxy);
+            }
+        }
+    } else if config.use_socks5_proxy {
+        if let Some(proxy_raw) = config.socks5_proxy.as_deref() {
+            let proxy_url = normalize_socks5_proxy_url(proxy_raw);
+            let proxy = Proxy::all(&proxy_url)
+                .with_context(|| format!("解析 socks5 代理地址失败: {proxy_url}"))?;
+            builder = builder.proxy(proxy);
+        }
+    }
+
+    if config.disable_tls_verify {
+        if cfg!(debug_assertions) {
+            builder = builder.danger_accept_invalid_certs(true);
+        } else {
+            tracing::warn!(
+                "disable_tls_verify 已设置，但 release 模式下强制保持证书校验开启"
+            );
+        }
     }
 
     let client = builder.build().context("创建 HTTP client 失败")?;
@@ -787,27 +943,6 @@ fn http_client() -> AnyResult<&'static Client> {
             .get()
             .expect("HTTP client 并发初始化后必须可读取")),
     }
-}
-
-fn socks5_proxy_from_env() -> Option<String> {
-    for key in [
-        "RQUICKJS_SOCKS5_PROXY",
-        "SOCKS5_PROXY",
-        "ALL_PROXY",
-        "all_proxy",
-    ] {
-        if let Ok(raw) = env::var(key) {
-            let value = raw.trim();
-            if value.is_empty() {
-                continue;
-            }
-            if value.contains("://") {
-                return Some(value.to_string());
-            }
-            return Some(format!("socks5h://{value}"));
-        }
-    }
-    None
 }
 
 pub fn http_request_start(
@@ -2535,7 +2670,7 @@ fn crypto_aes_ecb_pkcs7_decrypt_b64(payload_b64: String, key_raw: String) -> Any
     Ok(json!(text))
 }
 
-fn bridge_call_inner(name: String, args_json: Option<String>) -> AnyResult<Value> {
+fn bridge_call_inner(runtime_name: String, name: String, args_json: Option<String>) -> AnyResult<Value> {
     let args = parse_bridge_args(args_json)?;
 
     match name.as_str() {
@@ -2584,12 +2719,24 @@ fn bridge_call_inner(name: String, args_json: Option<String>) -> AnyResult<Value
             let key_raw = require_str_arg(&args, 1, "keyRaw")?;
             crypto_aes_ecb_pkcs7_decrypt_b64(payload_b64, key_raw)
         }
+        "flush_persistent_store" | "persistent.flush_persistent_store" => {
+            let key = require_str_arg(&args, 0, "key")?;
+            let value = require_str_arg(&args, 1, "value")?;
+            let out = call_registered_flush_persistent_store(runtime_name, key, value)?;
+            Ok(json!(out))
+        }
+        "load_persistent_store" | "persistent.load_persistent_store" => {
+            let key = require_str_arg(&args, 0, "key")?;
+            let value = require_str_arg(&args, 1, "value")?;
+            let out = call_registered_load_persistent_store(runtime_name, key, value)?;
+            Ok(json!(out))
+        }
         _ => Err(anyhow!("不支持的 bridge 方法: {name}")),
     }
 }
 
-pub fn host_call(name: String, args_json: Option<String>) -> String {
-    match bridge_call_inner(name, args_json) {
+pub fn host_call(runtime_name: String, name: String, args_json: Option<String>) -> String {
+    match bridge_call_inner(runtime_name, name, args_json) {
         Ok(data) => json!({ "ok": true, "data": data }).to_string(),
         Err(error) => json!({ "ok": false, "error": format!("{error:#}") }).to_string(),
     }

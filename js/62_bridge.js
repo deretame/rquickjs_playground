@@ -12,7 +12,20 @@
     return parseHost(raw);
   }
 
+  async function flushPersistentStore(key, value) {
+    return call("flush_persistent_store", String(key), String(value));
+  }
+
+  async function loadPersistentStore(key, value) {
+    return call("load_persistent_store", String(key), String(value));
+  }
+
   globalThis.__web.bridge = {
     call,
+  };
+
+  globalThis.__web.persistentStore = {
+    flushPersistentStore,
+    loadPersistentStore,
   };
 })();
