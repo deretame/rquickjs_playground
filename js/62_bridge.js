@@ -12,20 +12,20 @@
     return parseHost(raw);
   }
 
-  async function flushPersistentStore(key, value) {
-    return call("flush_persistent_store", String(key), String(value));
+  async function savePluginConfig(key, value) {
+    return call("save_plugin_config", String(key), String(value));
   }
 
-  async function loadPersistentStore(key, value) {
-    return call("load_persistent_store", String(key), String(value));
+  async function loadPluginConfig(key, value) {
+    return call("load_plugin_config", String(key), String(value));
   }
 
   globalThis.__web.bridge = {
     call,
   };
 
-  globalThis.__web.persistentStore = {
-    flushPersistentStore,
-    loadPersistentStore,
+  globalThis.__web.pluginConfig = {
+    savePluginConfig,
+    loadPluginConfig,
   };
 })();

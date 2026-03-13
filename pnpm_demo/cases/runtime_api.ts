@@ -52,9 +52,6 @@ export default async function main(config: unknown = {}) {
   await fsApi.promises.rm(filePath, { force: true });
 
   const fetchFn = requireApi("fetch");
-  const XHR = requireApi("XMLHttpRequest");
-  const xhr = new XHR();
-  xhr.open("GET", `${baseUrl}/runtime-api-xhr`);
 
   const formData = new runtime.FormData();
   formData.append("name", "runtime-api");
@@ -75,7 +72,6 @@ export default async function main(config: unknown = {}) {
     && wasiStderr.length === 0
     && fileText === "hello-runtime-api"
     && typeof fetchFn === "function"
-    && typeof xhr.send === "function"
     && formData.get("name") === "runtime-api";
 
   return {
@@ -85,6 +81,5 @@ export default async function main(config: unknown = {}) {
     bridgeSum,
     fileText,
     hasFetch: typeof fetchFn === "function",
-    hasXhrSend: typeof xhr.send === "function",
   };
 }

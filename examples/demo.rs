@@ -1,7 +1,7 @@
 use rquickjs_playground::AsyncHostRuntime;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let host = AsyncHostRuntime::new(true, "example-demo")?;
+    let host = AsyncHostRuntime::new("example-demo")?;
 
     let script = r#"
         (async () => {

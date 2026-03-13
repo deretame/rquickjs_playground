@@ -1,12 +1,11 @@
 import type {
-  AxiosLike,
   BridgeApi,
   CacheApi,
   CryptoApi,
   FsApi,
   NativeApi,
   PathApi,
-  PersistentStoreApi,
+  PluginConfigApi,
   PluginApi,
   WasiApi,
 } from "../types/runtime-globals";
@@ -18,14 +17,13 @@ export interface RuntimeApiSet {
   Request: typeof Request;
   Response: typeof Response;
   fetch: typeof fetch;
-  XMLHttpRequest: typeof XMLHttpRequest;
   fs: FsApi;
   FSError: new (message?: string, code?: string, path?: string) => Error;
   native: NativeApi;
   wasi: WasiApi;
   cache: CacheApi;
   bridge: BridgeApi;
-  persistentStore: PersistentStoreApi;
+  pluginConfig: PluginConfigApi;
   plugin: PluginApi;
   path: PathApi;
   URL: typeof URL;
@@ -40,7 +38,6 @@ export interface RuntimeApiSet {
   TextDecoder: typeof TextDecoder;
   Buffer: typeof Buffer;
   console: Console;
-  axios: AxiosLike;
 }
 
 export type RuntimeApiName = keyof RuntimeApiSet;
@@ -100,14 +97,13 @@ export function getRuntimeApis(): Partial<RuntimeApiSet> {
     Request: getApi("Request"),
     Response: getApi("Response"),
     fetch: getApi("fetch"),
-    XMLHttpRequest: getApi("XMLHttpRequest"),
     fs: getApi("fs"),
     FSError: getApi("FSError"),
     native: getApi("native"),
     wasi: getApi("wasi"),
     cache: getApi("cache"),
     bridge: getApi("bridge"),
-    persistentStore: getApi("persistentStore"),
+    pluginConfig: getApi("pluginConfig"),
     plugin: getApi("plugin"),
     path: getApi("path"),
     URL: getApi("URL"),
@@ -122,7 +118,6 @@ export function getRuntimeApis(): Partial<RuntimeApiSet> {
     TextDecoder: getApi("TextDecoder"),
     Buffer: getApi("Buffer"),
     console: getApi("console"),
-    axios: getApi("axios"),
   };
 }
 
@@ -133,14 +128,13 @@ export const runtime = {
   get Request() { return requireApi("Request"); },
   get Response() { return requireApi("Response"); },
   get fetch() { return requireApi("fetch"); },
-  get XMLHttpRequest() { return requireApi("XMLHttpRequest"); },
   get fs() { return requireApi("fs"); },
   get FSError() { return requireApi("FSError"); },
   get native() { return requireApi("native"); },
   get wasi() { return requireApi("wasi"); },
   get cache() { return requireApi("cache"); },
   get bridge() { return requireApi("bridge"); },
-  get persistentStore() { return requireApi("persistentStore"); },
+  get pluginConfig() { return requireApi("pluginConfig"); },
   get plugin() { return requireApi("plugin"); },
   get path() { return requireApi("path"); },
   get URL() { return requireApi("URL"); },
@@ -154,5 +148,4 @@ export const runtime = {
   get TextDecoder() { return requireApi("TextDecoder"); },
   get Buffer() { return requireApi("Buffer"); },
   get console() { return requireApi("console"); },
-  get axios() { return requireApi("axios"); },
 };

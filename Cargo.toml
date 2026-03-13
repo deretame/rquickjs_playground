@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = []
+default = ["host-fs"]
 host-fs = []
 
 [dependencies]
@@ -19,7 +19,14 @@ tokio = { version = "1.46.1", features = [
     "time",
 ] }
 reqwest = { version = "0.12.28", default-features = false, features = [
+    "json",
+    "stream",
+    "charset",
     "gzip",
+    "brotli",
+    "deflate",
+    "zstd",
+    "cookies",
     "multipart",
     "rustls-tls",
     "socks",

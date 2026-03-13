@@ -6,7 +6,7 @@ pub use host_runtime::{
 };
 pub use web_runtime::{
     HttpClientConfig, configure_http_client, current_http_client_config,
-    register_flush_persistent_store_handler, register_load_persistent_store_handler,
+    register_load_plugin_config_handler, register_save_plugin_config_handler,
 };
 
 #[cfg(test)]

@@ -10,7 +10,7 @@ use tokio::sync::oneshot;
 
 #[test]
 fn async_runtime_spawn_is_non_blocking() {
-    let runtime = AsyncHostRuntime::new(false, "task-runtime-non-blocking")
+    let runtime = AsyncHostRuntime::new("task-runtime-non-blocking")
         .expect("创建 AsyncHostRuntime 失败");
 
     let script = r#"
@@ -32,7 +32,7 @@ fn async_runtime_spawn_is_non_blocking() {
 
 #[test]
 fn async_runtime_stats_and_drop() {
-    let runtime = AsyncHostRuntime::new(false, "task-runtime-stats-drop")
+    let runtime = AsyncHostRuntime::new("task-runtime-stats-drop")
         .expect("创建 AsyncHostRuntime 失败");
 
     let handle = runtime
@@ -54,7 +54,7 @@ fn async_runtime_runs_multiple_io_tasks_concurrently() {
     const DELAY_MS: u64 = 40;
 
     let (addr, shutdown_tx, handle) = spawn_delay_server(DELAY_MS);
-    let runtime = AsyncHostRuntime::new(false, "task-runtime-concurrent-io")
+    let runtime = AsyncHostRuntime::new("task-runtime-concurrent-io")
         .expect("创建 AsyncHostRuntime 失败");
 
     let script = format!(
@@ -98,7 +98,7 @@ fn async_runtime_supports_many_independent_rust_async_waiters() {
 
     let (addr, shutdown_tx, handle) = spawn_delay_server(DELAY_MS);
     let runtime = Arc::new(
-        AsyncHostRuntime::new(false, "task-runtime-many-waiters")
+        AsyncHostRuntime::new("task-runtime-many-waiters")
             .expect("创建 AsyncHostRuntime 失败"),
     );
 
@@ -159,7 +159,7 @@ fn async_runtime_wait_handle_avoids_polling() {
 
     let (addr, shutdown_tx, handle) = spawn_delay_server(DELAY_MS);
     let runtime =
-        AsyncHostRuntime::new(false, "task-runtime-wait-handle").expect("创建 AsyncHostRuntime 失败");
+        AsyncHostRuntime::new("task-runtime-wait-handle").expect("创建 AsyncHostRuntime 失败");
 
     let script = format!(
         r#"
@@ -201,7 +201,7 @@ struct PingPayload {
 
 #[test]
 fn async_runtime_spawn_json_is_typed_and_awaitable() {
-    let runtime = AsyncHostRuntime::new(false, "task-runtime-json").expect("创建 AsyncHostRuntime 失败");
+    let runtime = AsyncHostRuntime::new("task-runtime-json").expect("创建 AsyncHostRuntime 失败");
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -226,7 +226,7 @@ fn async_runtime_spawn_json_is_typed_and_awaitable() {
 #[test]
 fn async_runtime_handle_drop_cleans_pending_state() {
     let runtime =
-        AsyncHostRuntime::new(false, "task-runtime-handle-drop").expect("创建 AsyncHostRuntime 失败");
+        AsyncHostRuntime::new("task-runtime-handle-drop").expect("创建 AsyncHostRuntime 失败");
     let handle = runtime
         .spawn("(async () => { await new Promise(() => {}); return \"ok\"; })()")
         .expect("提交任务失败");
@@ -243,7 +243,7 @@ fn async_runtime_handle_drop_cleans_pending_state() {
 
 #[test]
 fn async_runtime_drop_unblocks_pending_waiter() {
-    let runtime = AsyncHostRuntime::new(false, "task-runtime-drop-unblock")
+    let runtime = AsyncHostRuntime::new("task-runtime-drop-unblock")
         .expect("创建 AsyncHostRuntime 失败");
     let handle = runtime
         .spawn(
@@ -318,7 +318,7 @@ fn benchmark_promise_all_vs_wait_handle_1000_fetch() {
 fn run_benchmark_case(total: usize, delay_ms: u64) {
     let (addr, shutdown_tx, handle) = spawn_delay_server(delay_ms);
 
-    let host = AsyncHostRuntime::new(false, "task-runtime-bench-promise-all")
+    let host = AsyncHostRuntime::new("task-runtime-bench-promise-all")
         .expect("创建 AsyncHostRuntime 失败");
     let promise_all_script = format!(
         r#"
@@ -349,7 +349,7 @@ fn run_benchmark_case(total: usize, delay_ms: u64) {
 
     assert_eq!(promise_payload["count"].as_u64(), Some(total as u64));
 
-    let async_rt = AsyncHostRuntime::new(false, "task-runtime-bench-wait-handle")
+    let async_rt = AsyncHostRuntime::new("task-runtime-bench-wait-handle")
         .expect("创建 AsyncHostRuntime 失败");
     let one_fetch_script = format!(
         r#"

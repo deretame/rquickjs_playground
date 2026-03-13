@@ -11,8 +11,8 @@ use std::thread;
 use tokio::sync::oneshot;
 
 use crate::web_runtime::{
-    AXIOS_BUNDLE, WEB_POLYFILL, http_request_drop_evented, http_request_start_evented,
-    install_host_bindings, wasi_run_drop_evented, wasi_run_start_evented,
+    WEB_POLYFILL, http_request_drop_evented, http_request_start_evented, install_host_bindings,
+    timer_drop_evented, timer_start_evented, wasi_run_drop_evented, wasi_run_start_evented,
 };
 
 #[cfg(feature = "host-fs")]
@@ -233,6 +233,10 @@ enum HostEvent {
         id: u64,
         payload: String,
     },
+    TimerCompleted {
+        id: u64,
+        payload: String,
+    },
 }
 
 enum WorkerSignal {
@@ -257,16 +261,13 @@ struct RuntimeShared {
 }
 
 impl HostRuntime {
-    pub fn new(load_axios: bool, cache_scope_id: String) -> Result<Self, rquickjs::Error> {
+    pub fn new(cache_scope_id: String) -> Result<Self, rquickjs::Error> {
         let runtime = Runtime::new()?;
         let context = Context::full(&runtime)?;
 
         context.with(|ctx| {
             install_host_bindings(&ctx, &cache_scope_id)?;
             ctx.eval::<(), _>(WEB_POLYFILL)?;
-            if load_axios && !AXIOS_BUNDLE.is_empty() {
-                ctx.eval::<(), _>(AXIOS_BUNDLE)?;
-            }
             Ok::<(), rquickjs::Error>(())
         })?;
 
@@ -317,7 +318,7 @@ impl HostRuntime {
 }
 
 impl AsyncHostRuntime {
-    pub fn new(load_axios: bool, cache_scope_id: impl Into<String>) -> Result<Self, String> {
+    pub fn new(cache_scope_id: impl Into<String>) -> Result<Self, String> {
         let cache_scope_id = cache_scope_id.into();
         let cache_scope_id_for_worker = cache_scope_id.clone();
         let (tx, rx) = mpsc::channel::<WorkerSignal>();
@@ -340,7 +341,7 @@ impl AsyncHostRuntime {
         let (init_tx, init_rx) = mpsc::channel::<Result<(), String>>();
 
         thread::spawn(move || {
-            let host = match HostRuntime::new(load_axios, cache_scope_id_for_worker) {
+            let host = match HostRuntime::new(cache_scope_id_for_worker) {
                 Ok(host) => host,
                 Err(err) => {
                     let _ = init_tx.send(Err(format!("初始化 HostRuntime 失败: {err}")));
@@ -987,6 +988,21 @@ fn install_evented_host_bindings_worker(
         Func::from(http_request_drop_evented),
     )?;
 
+    let timer_tx = signal_tx.clone();
+    globals.set(
+        "__timer_start_evented",
+        Function::new(ctx.clone(), move |delay_ms: i64| {
+            let tx = timer_tx.clone();
+            timer_start_evented(delay_ms, move |id, payload| {
+                let _ = tx.send(WorkerSignal::HostEvent(HostEvent::TimerCompleted {
+                    id,
+                    payload,
+                }));
+            })
+        })?,
+    )?;
+    globals.set("__timer_drop_evented", Func::from(timer_drop_evented))?;
+
     #[cfg(feature = "host-fs")]
     {
         let fs_tx = signal_tx.clone();
@@ -1100,6 +1116,10 @@ fn handle_host_event_in_ctx(
         }
         HostEvent::WasiCompleted { id, payload } => {
             let func: Function = globals.get("__host_runtime_wasi_complete")?;
+            func.call::<_, ()>((id, payload))
+        }
+        HostEvent::TimerCompleted { id, payload } => {
+            let func: Function = globals.get("__host_runtime_timer_complete")?;
             func.call::<_, ()>((id, payload))
         }
     }

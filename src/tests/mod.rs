@@ -1,20 +1,16 @@
-pub mod axios;
 pub mod compat;
 pub mod fetch;
 pub mod fs;
 pub mod native;
 pub mod runtime;
 pub mod task_runtime;
-pub mod xhr;
 
-pub use crate::web_runtime::{run_async_script, run_async_script_with_axios};
+pub use crate::web_runtime::run_async_script;
 use serde_json::{json, Map, Value};
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc;
 use std::sync::OnceLock;
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use tiny_http::{Method as TinyMethod, Response, Server};
@@ -75,6 +71,20 @@ pub fn spawn_test_server_with_headers(
             }
             match server.recv_timeout(Duration::from_millis(100)) {
                 Ok(Some(mut request)) => {
+                    if request.url() == "/axios-binary" {
+                        let resp = Response::from_data(vec![0, 1, 2, 3, 250, 251, 252, 253, 254, 255])
+                            .with_status_code(200)
+                            .with_header(
+                                tiny_http::Header::from_bytes(
+                                    b"Content-Type".as_slice(),
+                                    b"application/octet-stream".as_slice(),
+                                )
+                                .expect("构造二进制响应头失败"),
+                            );
+                        let _ = request.respond(resp);
+                        continue;
+                    }
+
                     let method = match request.method() {
                         TinyMethod::Get => "GET",
                         TinyMethod::Post => "POST",
@@ -133,85 +143,6 @@ pub fn spawn_test_server_with_headers(
                     }
 
                     let resp = resp_builder;
-                    let _ = request.respond(resp);
-                }
-                Ok(None) => {}
-                Err(_) => {}
-            }
-        }
-    });
-
-    (addr, tx, handle)
-}
-
-pub fn spawn_test_server_with_statuses(
-    statuses: Vec<u16>,
-) -> (String, mpsc::Sender<()>, thread::JoinHandle<()>) {
-    let limit = statuses.len().max(1);
-    let server = Server::http("127.0.0.1:0").expect("启动测试服务失败");
-    let addr = format!("http://{}", server.server_addr());
-    let (tx, rx) = mpsc::channel::<()>();
-    let statuses = Arc::new(Mutex::new(VecDeque::from(statuses)));
-
-    let handle = thread::spawn(move || {
-        for _ in 0..limit {
-            if rx.try_recv().is_ok() {
-                break;
-            }
-            match server.recv_timeout(Duration::from_millis(100)) {
-                Ok(Some(mut request)) => {
-                    let method = match request.method() {
-                        TinyMethod::Get => "GET",
-                        TinyMethod::Post => "POST",
-                        TinyMethod::Put => "PUT",
-                        TinyMethod::Delete => "DELETE",
-                        TinyMethod::Patch => "PATCH",
-                        TinyMethod::Head => "HEAD",
-                        TinyMethod::Options => "OPTIONS",
-                        _ => "OTHER",
-                    };
-
-                    let mut body = String::new();
-                    let _ = request.as_reader().read_to_string(&mut body);
-
-                    let mut headers = Map::new();
-                    for header in request.headers() {
-                        headers.insert(
-                            header.field.as_str().to_string().to_lowercase(),
-                            Value::String(header.value.as_str().to_string()),
-                        );
-                    }
-
-                    let status = {
-                        let mut queue = statuses.lock().expect("状态队列加锁失败");
-                        queue.pop_front().unwrap_or(200)
-                    };
-
-                    let payload = json!({
-                        "method": method,
-                        "path": request.url(),
-                        "body": body,
-                        "headers": headers,
-                        "status": status,
-                    });
-
-                    let resp = Response::from_string(payload.to_string())
-                        .with_status_code(status)
-                        .with_header(
-                            tiny_http::Header::from_bytes(
-                                b"Content-Type".as_slice(),
-                                b"application/json".as_slice(),
-                            )
-                            .expect("构造响应头失败"),
-                        )
-                        .with_header(
-                            tiny_http::Header::from_bytes(
-                                b"X-Custom".as_slice(),
-                                b"custom-value".as_slice(),
-                            )
-                            .expect("构造自定义响应头失败"),
-                        );
-
                     let _ = request.respond(resp);
                 }
                 Ok(None) => {}

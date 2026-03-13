@@ -36,7 +36,7 @@ impl PluginManager {
             workers.push(tx);
 
             thread::spawn(move || {
-                let host = AsyncHostRuntime::new(false, format!("example-http-plugin-worker-{worker_id}"))
+                let host = AsyncHostRuntime::new(format!("example-http-plugin-worker-{worker_id}"))
                     .expect("创建 HostRuntime 失败");
                 host.spawn(plugin_bootstrap_script())
                     .expect("初始化插件脚本失败")
@@ -332,7 +332,7 @@ async fn main() {
     );
 
     let result = tokio::task::spawn_blocking(move || {
-        let host = AsyncHostRuntime::new(false, "example-http-plugin-main")
+        let host = AsyncHostRuntime::new("example-http-plugin-main")
             .expect("创建 HostRuntime 失败");
         host.spawn(&script).expect("执行 JS 请求失败").wait().expect("执行 JS 请求失败")
     })

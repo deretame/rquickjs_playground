@@ -44,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "#
     );
 
-    let host = AsyncHostRuntime::new(false, "example-concurrent-file-ops")?;
+    let host = AsyncHostRuntime::new("example-concurrent-file-ops")?;
     let start = Instant::now();
     let raw = host.spawn(&script)?.wait()?;
     let rust_elapsed = start.elapsed().as_millis();

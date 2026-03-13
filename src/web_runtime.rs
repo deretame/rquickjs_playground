@@ -43,8 +43,6 @@ pub const WEB_POLYFILL: &str = concat!(
     "\n",
     include_str!("../js/30_fetch.js"),
     "\n",
-    include_str!("../js/40_xhr.js"),
-    "\n",
     include_str!("../js/50_fs.js"),
     "\n",
     include_str!("../js/60_native.js"),
@@ -73,8 +71,6 @@ pub const WEB_POLYFILL: &str = concat!(
     "\n",
     include_str!("../js/30_fetch.js"),
     "\n",
-    include_str!("../js/40_xhr.js"),
-    "\n",
     include_str!("../js/60_native.js"),
     "\n",
     include_str!("../js/61_wasi.js"),
@@ -90,12 +86,6 @@ pub const WEB_POLYFILL: &str = concat!(
     include_str!("../js/99_exports.js"),
     "\n"
 );
-
-#[cfg(test)]
-pub const AXIOS_BUNDLE: &str = include_str!("../vendor/axios.min.js");
-
-#[cfg(not(test))]
-pub const AXIOS_BUNDLE: &str = "";
 
 pub fn install_host_bindings(ctx: &Ctx<'_>, cache_scope_id: &str) -> Result<(), rquickjs::Error> {
     let cache_scope_id = normalize_runtime_cache_scope_id(cache_scope_id);
@@ -210,6 +200,8 @@ static HTTP_REQ_EVENT_POOL: OnceLock<Mutex<HashMap<u64, PendingAbortTask>>> = On
 static FS_REQ_ID: AtomicU64 = AtomicU64::new(1);
 static FS_REQ_POOL: OnceLock<Mutex<HashMap<u64, PendingTask>>> = OnceLock::new();
 static FS_REQ_EVENT_POOL: OnceLock<Mutex<HashMap<u64, PendingAbortTask>>> = OnceLock::new();
+static TIMER_REQ_ID: AtomicU64 = AtomicU64::new(1);
+static TIMER_REQ_EVENT_POOL: OnceLock<Mutex<HashMap<u64, PendingAbortTask>>> = OnceLock::new();
 static WASI_REQ_ID: AtomicU64 = AtomicU64::new(1);
 static WASI_REQ_POOL: OnceLock<Mutex<HashMap<u64, PendingTask>>> = OnceLock::new();
 static WASI_REQ_EVENT_POOL: OnceLock<Mutex<HashMap<u64, PendingAbortTask>>> = OnceLock::new();
@@ -228,6 +220,7 @@ static FS_IO_SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static WASI_IO_SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static HTTP_STALE_DROPS: AtomicU64 = AtomicU64::new(0);
 static FS_STALE_DROPS: AtomicU64 = AtomicU64::new(0);
+static TIMER_STALE_DROPS: AtomicU64 = AtomicU64::new(0);
 static WASI_STALE_DROPS: AtomicU64 = AtomicU64::new(0);
 static CACHE_TX: OnceLock<mpsc::Sender<CacheCommand>> = OnceLock::new();
 static LOG_TX: OnceLock<mpsc::Sender<LogEvent>> = OnceLock::new();
@@ -236,11 +229,10 @@ static LOG_WRITTEN: AtomicU64 = AtomicU64::new(0);
 static LOG_DROPPED: AtomicU64 = AtomicU64::new(0);
 static LOG_ERRORS: AtomicU64 = AtomicU64::new(0);
 static LOG_PENDING: AtomicU64 = AtomicU64::new(0);
-type PersistentStoreHandler = Arc<dyn Fn(String, String, String) -> AnyResult<String> + Send + Sync + 'static>;
-static FLUSH_PERSISTENT_STORE_HANDLER: OnceLock<Mutex<Option<PersistentStoreHandler>>> =
-    OnceLock::new();
-static LOAD_PERSISTENT_STORE_HANDLER: OnceLock<Mutex<Option<PersistentStoreHandler>>> =
-    OnceLock::new();
+type PluginConfigHandler =
+    Arc<dyn Fn(String, String, String) -> AnyResult<String> + Send + Sync + 'static>;
+static SAVE_PLUGIN_CONFIG_HANDLER: OnceLock<Mutex<Option<PluginConfigHandler>>> = OnceLock::new();
+static LOAD_PLUGIN_CONFIG_HANDLER: OnceLock<Mutex<Option<PluginConfigHandler>>> = OnceLock::new();
 
 struct PendingTask {
     rx: mpsc::Receiver<String>,
@@ -311,55 +303,55 @@ fn http_req_pool() -> &'static Mutex<HashMap<u64, PendingTask>> {
     HTTP_REQ_POOL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn flush_persistent_store_handler_cell() -> &'static Mutex<Option<PersistentStoreHandler>> {
-    FLUSH_PERSISTENT_STORE_HANDLER.get_or_init(|| Mutex::new(None))
+fn save_plugin_config_handler_cell() -> &'static Mutex<Option<PluginConfigHandler>> {
+    SAVE_PLUGIN_CONFIG_HANDLER.get_or_init(|| Mutex::new(None))
 }
 
-fn load_persistent_store_handler_cell() -> &'static Mutex<Option<PersistentStoreHandler>> {
-    LOAD_PERSISTENT_STORE_HANDLER.get_or_init(|| Mutex::new(None))
+fn load_plugin_config_handler_cell() -> &'static Mutex<Option<PluginConfigHandler>> {
+    LOAD_PLUGIN_CONFIG_HANDLER.get_or_init(|| Mutex::new(None))
 }
 
-pub fn register_flush_persistent_store_handler<F>(handler: F)
+pub fn register_save_plugin_config_handler<F>(handler: F)
 where
     F: Fn(String, String, String) -> AnyResult<String> + Send + Sync + 'static,
 {
-    if let Ok(mut guard) = flush_persistent_store_handler_cell().lock() {
+    if let Ok(mut guard) = save_plugin_config_handler_cell().lock() {
         *guard = Some(Arc::new(handler));
     }
 }
 
-pub fn register_load_persistent_store_handler<F>(handler: F)
+pub fn register_load_plugin_config_handler<F>(handler: F)
 where
     F: Fn(String, String, String) -> AnyResult<String> + Send + Sync + 'static,
 {
-    if let Ok(mut guard) = load_persistent_store_handler_cell().lock() {
+    if let Ok(mut guard) = load_plugin_config_handler_cell().lock() {
         *guard = Some(Arc::new(handler));
     }
 }
 
-fn call_registered_flush_persistent_store(
+fn call_registered_save_plugin_config(
     runtime_name: String,
     key: String,
     value: String,
 ) -> AnyResult<String> {
-    let handler = flush_persistent_store_handler_cell()
+    let handler = save_plugin_config_handler_cell()
         .lock()
-        .map_err(|_| anyhow!("flush_persistent_store 回调锁已损坏"))?
+        .map_err(|_| anyhow!("save_plugin_config 回调锁已损坏"))?
         .clone()
-        .ok_or_else(|| anyhow!("flush_persistent_store 回调未注册"))?;
+        .ok_or_else(|| anyhow!("save_plugin_config 回调未注册"))?;
     handler(runtime_name, key, value)
 }
 
-fn call_registered_load_persistent_store(
+fn call_registered_load_plugin_config(
     runtime_name: String,
     key: String,
     value: String,
 ) -> AnyResult<String> {
-    let handler = load_persistent_store_handler_cell()
+    let handler = load_plugin_config_handler_cell()
         .lock()
-        .map_err(|_| anyhow!("load_persistent_store 回调锁已损坏"))?
+        .map_err(|_| anyhow!("load_plugin_config 回调锁已损坏"))?
         .clone()
-        .ok_or_else(|| anyhow!("load_persistent_store 回调未注册"))?;
+        .ok_or_else(|| anyhow!("load_plugin_config 回调未注册"))?;
     handler(runtime_name, key, value)
 }
 
@@ -373,6 +365,10 @@ fn fs_req_pool() -> &'static Mutex<HashMap<u64, PendingTask>> {
 
 fn fs_req_event_pool() -> &'static Mutex<HashMap<u64, PendingAbortTask>> {
     FS_REQ_EVENT_POOL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn timer_req_event_pool() -> &'static Mutex<HashMap<u64, PendingAbortTask>> {
+    TIMER_REQ_EVENT_POOL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn wasi_req_pool() -> &'static Mutex<HashMap<u64, PendingTask>> {
@@ -418,8 +414,10 @@ const WASI_MAX_IN_FLIGHT: usize = 32;
 const HTTP_OFFLOAD_BODY_HEADER: &str = "x-rquickjs-host-offload-binary-v1";
 const HTTP_WASI_TRANSFORM_HEADER: &str = "x-rquickjs-host-wasi-transform-b64-v1";
 const HTTP_FORMDATA_BODY_HEADER: &str = "x-rquickjs-host-body-formdata-v1";
+const HTTP_AUTO_OFFLOAD_SIZE_THRESHOLD: u64 = 1 * 1024 * 1024;
 const HTTP_MAX_PENDING: usize = 4096;
 const FS_MAX_PENDING: usize = 4096;
+const TIMER_MAX_PENDING: usize = 8192;
 const WASI_MAX_PENDING: usize = 1024;
 const PENDING_TASK_TTL: Duration = Duration::from_secs(120);
 
@@ -485,6 +483,78 @@ fn header_truthy(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+fn is_binary_content(content_type: &str) -> bool {
+    let ct = content_type.to_lowercase();
+
+    if ct.starts_with("text/")
+        || ct.contains("json")
+        || ct.contains("xml")
+        || ct.contains("javascript")
+    {
+        return false;
+    }
+
+    if ct.starts_with("image/")
+        || ct.starts_with("audio/")
+        || ct.starts_with("video/")
+        || ct.starts_with("font/")
+        || ct.starts_with("multipart/")
+    {
+        return true;
+    }
+
+    static BINARY_PREFIXES: &[&str] = &[
+        "application/octet-stream",
+        "application/pdf",
+        "application/zip",
+        "application/gzip",
+        "application/wasm",
+        "application/vnd",
+        "application/x-protobuf",
+        "application/x-msgpack",
+    ];
+
+    BINARY_PREFIXES.iter().any(|&prefix| ct.starts_with(prefix))
+}
+
+fn should_auto_offload_response(headers: &reqwest::header::HeaderMap) -> bool {
+    if let Some(content_disposition) = headers
+        .get(reqwest::header::CONTENT_DISPOSITION)
+        .and_then(|v| v.to_str().ok())
+    {
+        let cd = content_disposition.to_ascii_lowercase();
+        if cd.contains("attachment") {
+            return true;
+        }
+    }
+
+    if let Some(content_length) = headers
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        if content_length >= HTTP_AUTO_OFFLOAD_SIZE_THRESHOLD {
+            return true;
+        }
+    }
+
+    let content_type = headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if content_type.is_empty() {
+        return false;
+    }
+
+    if is_binary_content(&content_type) {
+        return true;
+    }
+
+    false
 }
 
 #[derive(Debug, Deserialize)]
@@ -929,9 +999,7 @@ fn http_client() -> AnyResult<&'static Client> {
         if cfg!(debug_assertions) {
             builder = builder.danger_accept_invalid_certs(true);
         } else {
-            tracing::warn!(
-                "disable_tls_verify 已设置，但 release 模式下强制保持证书校验开启"
-            );
+            tracing::warn!("disable_tls_verify 已设置，但 release 模式下强制保持证书校验开启");
         }
     }
 
@@ -1103,6 +1171,58 @@ pub fn http_request_drop_evented(id: u64) -> String {
     let mut pool = http_req_event_pool()
         .lock()
         .expect("http event 请求池加锁失败");
+    let existed = if let Some(pending) = pool.remove(&id) {
+        pending.task.abort();
+        true
+    } else {
+        false
+    };
+    json!({ "ok": true, "dropped": existed }).to_string()
+}
+
+pub fn timer_start_evented<F>(delay_ms: i64, on_complete: F) -> String
+where
+    F: FnOnce(u64, String) + Send + 'static,
+{
+    {
+        let mut pool = timer_req_event_pool()
+            .lock()
+            .expect("timer event 请求池加锁失败");
+        cleanup_stale_pending_abort(&mut pool, &TIMER_STALE_DROPS);
+        if pool.len() >= TIMER_MAX_PENDING {
+            return json!({ "ok": false, "error": "timer pending 队列已满" }).to_string();
+        }
+    }
+
+    let id = TIMER_REQ_ID.fetch_add(1, Ordering::Relaxed);
+    let normalized_delay_ms = delay_ms.clamp(0, 24 * 60 * 60 * 1000) as u64;
+
+    let task = host_async_runtime().spawn(async move {
+        tokio::time::sleep(Duration::from_millis(normalized_delay_ms)).await;
+        on_complete(id, json!({ "ok": true }).to_string());
+        let _ = timer_req_event_pool().lock().map(|mut pool| pool.remove(&id));
+    });
+
+    {
+        let mut pool = timer_req_event_pool()
+            .lock()
+            .expect("timer event 请求池加锁失败");
+        pool.insert(
+            id,
+            PendingAbortTask {
+                task,
+                created_at: Instant::now(),
+            },
+        );
+    }
+
+    json!({ "ok": true, "id": id }).to_string()
+}
+
+pub fn timer_drop_evented(id: u64) -> String {
+    let mut pool = timer_req_event_pool()
+        .lock()
+        .expect("timer event 请求池加锁失败");
     let existed = if let Some(pending) = pool.remove(&id) {
         pending.task.abort();
         true
@@ -1733,6 +1853,7 @@ async fn http_request_inner_async(
     }
 
     let response = builder.send().await.context("发送 HTTP 请求失败")?;
+    let auto_offload_body = should_auto_offload_response(response.headers());
     let status = response.status();
     let final_url = response.url().to_string();
 
@@ -1741,7 +1862,7 @@ async fn http_request_inner_async(
         headers_map.insert(name.to_string(), Value::String(value_text));
     }
 
-    if offload_body_to_native {
+    if offload_body_to_native || auto_offload_body {
         let mut body_bytes = response
             .bytes()
             .await
@@ -2670,7 +2791,11 @@ fn crypto_aes_ecb_pkcs7_decrypt_b64(payload_b64: String, key_raw: String) -> Any
     Ok(json!(text))
 }
 
-fn bridge_call_inner(runtime_name: String, name: String, args_json: Option<String>) -> AnyResult<Value> {
+fn bridge_call_inner(
+    runtime_name: String,
+    name: String,
+    args_json: Option<String>,
+) -> AnyResult<Value> {
     let args = parse_bridge_args(args_json)?;
 
     match name.as_str() {
@@ -2719,16 +2844,16 @@ fn bridge_call_inner(runtime_name: String, name: String, args_json: Option<Strin
             let key_raw = require_str_arg(&args, 1, "keyRaw")?;
             crypto_aes_ecb_pkcs7_decrypt_b64(payload_b64, key_raw)
         }
-        "flush_persistent_store" | "persistent.flush_persistent_store" => {
+        "save_plugin_config" | "plugin_config.save_plugin_config" => {
             let key = require_str_arg(&args, 0, "key")?;
             let value = require_str_arg(&args, 1, "value")?;
-            let out = call_registered_flush_persistent_store(runtime_name, key, value)?;
+            let out = call_registered_save_plugin_config(runtime_name, key, value)?;
             Ok(json!(out))
         }
-        "load_persistent_store" | "persistent.load_persistent_store" => {
+        "load_plugin_config" | "plugin_config.load_plugin_config" => {
             let key = require_str_arg(&args, 0, "key")?;
             let value = require_str_arg(&args, 1, "value")?;
-            let out = call_registered_load_persistent_store(runtime_name, key, value)?;
+            let out = call_registered_load_plugin_config(runtime_name, key, value)?;
             Ok(json!(out))
         }
         _ => Err(anyhow!("不支持的 bridge 方法: {name}")),
@@ -3203,20 +3328,7 @@ pub fn fs_mkdtemp(prefix: String) -> String {
 
 #[cfg(test)]
 pub fn run_async_script(script: &str) -> Result<String, Box<dyn std::error::Error>> {
-    run_async_script_internal(script, false)
-}
-
-#[cfg(test)]
-pub fn run_async_script_with_axios(script: &str) -> Result<String, Box<dyn std::error::Error>> {
-    run_async_script_internal(script, true)
-}
-
-#[cfg(test)]
-fn run_async_script_internal(
-    script: &str,
-    load_axios: bool,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let runtime = crate::host_runtime::AsyncHostRuntime::new(load_axios, "test-web-runtime")?;
+    let runtime = crate::host_runtime::AsyncHostRuntime::new("test-web-runtime")?;
     let task = runtime.spawn(script)?;
     task.wait().map_err(|e| e.into())
 }

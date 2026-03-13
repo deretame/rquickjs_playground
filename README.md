@@ -2,7 +2,7 @@
 
 这个项目提供一个 Rust 宿主 + QuickJS 运行时，核心能力有三块：
 
-- Web API 兼容层（`fetch` / `XMLHttpRequest` / `axios`）
+- Web API 兼容层（`fetch`）
 - 异步文件 API（`fs` / `fs.promises`，无同步接口）
 - Native 二进制计算管道 + WASI 模块执行
 
@@ -27,7 +27,7 @@ rquickjs_playground = { path = "../rquickjs_playground" }
 use rquickjs_playground::AsyncHostRuntime;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let host = AsyncHostRuntime::new(true, "demo-runtime")?;
+    let host = AsyncHostRuntime::new("demo-runtime")?;
     let output = host
         .spawn("(async () => JSON.stringify({ ok: true }))()")?
         .wait()?;
@@ -36,7 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-说明：`AsyncHostRuntime::new(load_axios, cache_scope_id)` 的第二个参数是实例级缓存作用域 id。宿主会在 Rust 侧自动把 cache key 前缀化，不需要在 JS 里手动拼接 runtime id。
+说明：`AsyncHostRuntime::new(cache_scope_id)` 的参数是实例级缓存作用域 id。宿主会在 Rust 侧自动把 cache key 前缀化，不需要在 JS 里手动拼接 runtime id。
 
 如果你想运行仓库里的演示：
 
@@ -178,8 +178,6 @@ cargo test
 - `src/tests/native.rs`
 - `src/tests/fs.rs`
 - `src/tests/fetch.rs`
-- `src/tests/xhr.rs`
-- `src/tests/axios.rs`
 
 ---
 
@@ -461,10 +459,10 @@ const id = runtime.uuidv4();
 
 可用能力包括（按需读取）：
 
-- Web API：`fetch`、`Request`、`Response`、`Headers`、`XMLHttpRequest`、`FormData`、`Blob`、`URL` 等
+- Web API：`fetch`、`Request`、`Response`、`Headers`、`FormData`、`Blob`、`URL` 等
 - Host API：`fs`、`native`、`wasi`、`cache`、`bridge`、`plugin`
 - Runtime API：`crypto/nodeCryptoCompat`、`uuidv4`、`Buffer`、`TextEncoder/TextDecoder`
 
 并且提供了 `getApi(name)`（可选）与 `requireApi(name)`（缺失直接抛错）两套调用方式。
 
-补充：当前 `cache` API 不再提供 `cache.scoped(...)`。如果需要业务内分组，请直接在 key 上自行加前缀（例如 `"jm_http::jwt"`）。实例级隔离由 `AsyncHostRuntime::new(..., cache_scope_id)` 在 Rust 侧统一处理。
+补充：当前 `cache` API 不再提供 `cache.scoped(...)`。如果需要业务内分组，请直接在 key 上自行加前缀（例如 `"jm_http::jwt"`）。实例级隔离由 `AsyncHostRuntime::new(cache_scope_id)` 在 Rust 侧统一处理。

@@ -6,7 +6,6 @@
     Request,
     Response,
     fetch,
-    XMLHttpRequest,
     fs,
     FSError,
     native,
@@ -14,7 +13,7 @@
     cache,
     console,
     bridge,
-    persistentStore,
+    pluginConfig,
     plugin,
     URL,
     URLSearchParams,
@@ -34,7 +33,6 @@
   globalThis.Request = Request;
   globalThis.Response = Response;
   globalThis.fetch = fetch;
-  globalThis.XMLHttpRequest = XMLHttpRequest;
   globalThis.fs = fs;
   globalThis.FSError = FSError;
   globalThis.native = native;
@@ -42,7 +40,7 @@
   globalThis.cache = cache;
   globalThis.console = console;
   globalThis.bridge = bridge;
-  globalThis.persistentStore = persistentStore;
+  globalThis.pluginConfig = pluginConfig;
   globalThis.plugin = plugin;
   globalThis.URL = URL;
   globalThis.URLSearchParams = URLSearchParams;

@@ -495,6 +495,77 @@ fn fetch_offload_binary_to_native_buffer() {
 }
 
 #[test]
+fn fetch_offload_arraybuffer_works_without_custom_api() {
+    let (base_url, tx, handle) = spawn_test_server(2);
+    let script = format!(
+        r#"
+          (async () => {{
+            const res = await fetch("{}/hello?img=arraybuffer", {{
+              headers: {{
+                "x-rquickjs-host-offload-binary-v1": "true"
+              }}
+            }});
+            const ab = await res.arrayBuffer();
+            const bytes = new Uint8Array(ab);
+            const text = new TextDecoder().decode(bytes);
+            return JSON.stringify({{
+              status: res.status,
+              offloaded: res.offloaded === true,
+              len: bytes.length,
+              hasPayload: text.includes("\"method\":\"GET\"")
+            }});
+          }})()
+        "#,
+        base_url
+    );
+
+    let result = run_async_script(&script).expect("执行脚本失败");
+    let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
+
+    assert_eq!(parsed["status"], 200);
+    assert_eq!(parsed["offloaded"], true);
+    assert!(parsed["len"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(parsed["hasPayload"], true);
+
+    let _ = tx.send(());
+    let _ = handle.join();
+}
+
+#[test]
+fn fetch_auto_offload_octet_stream_arraybuffer() {
+    let (base_url, tx, handle) = spawn_test_server(2);
+    let script = format!(
+        r#"
+          (async () => {{
+            const res = await fetch("{}/axios-binary");
+            const ab = await res.arrayBuffer();
+            const bytes = new Uint8Array(ab);
+            return JSON.stringify({{
+              status: res.status,
+              offloaded: res.offloaded === true,
+              len: bytes.length,
+              first: bytes[0],
+              last: bytes[bytes.length - 1]
+            }});
+          }})()
+        "#,
+        base_url
+    );
+
+    let result = run_async_script(&script).expect("执行脚本失败");
+    let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
+
+    assert_eq!(parsed["status"], 200);
+    assert_eq!(parsed["offloaded"], true);
+    assert_eq!(parsed["len"], 10);
+    assert_eq!(parsed["first"], 0);
+    assert_eq!(parsed["last"], 255);
+
+    let _ = tx.send(());
+    let _ = handle.join();
+}
+
+#[test]
 fn fetch_offload_with_wasi_transform_success() {
     let (base_url, tx, handle) = spawn_test_server(2);
     let wasm = wasi_echo_stdin_module_bytes();

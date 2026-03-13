@@ -22,11 +22,11 @@ expectType<boolean>(cache.has("k"));
 
 const bridge = requireApi("bridge");
 expectType<Promise<unknown>>(bridge.call("math.add", 1, 2));
-expectType<Promise<string>>(bridge.call("flush_persistent_store", "auth.token", "abc"));
+expectType<Promise<string>>(bridge.call("save_plugin_config", "auth.token", "abc"));
 
-const persistentStore = requireApi("persistentStore");
-expectType<Promise<string>>(persistentStore.flushPersistentStore("auth.token", "abc"));
-expectType<Promise<string>>(persistentStore.loadPersistentStore("auth.token", ""));
+const pluginConfig = requireApi("pluginConfig");
+expectType<Promise<string>>(pluginConfig.savePluginConfig("auth.token", "abc"));
+expectType<Promise<string>>(pluginConfig.loadPluginConfig("auth.token", ""));
 
 const maybeCrypto = getCryptoLike();
 expectType<string | undefined>(

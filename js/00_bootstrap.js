@@ -19,31 +19,156 @@
   if (!globalThis.setTimeout) {
     let timerId = 1;
     const active = new Map();
+    const hostToLocal = new Map();
 
-    globalThis.setTimeout = function setTimeout(cb, _ms, ...args) {
+    function hasHostTimer() {
+      return (
+        typeof globalThis.__timer_start_evented === "function"
+        && typeof globalThis.__timer_drop_evented === "function"
+      );
+    }
+
+    const prevTimerComplete = globalThis.__host_runtime_timer_complete;
+
+    function normalizeDelay(ms) {
+      const n = Number(ms);
+      if (!Number.isFinite(n) || n <= 0) return 0;
+      return Math.min(24 * 60 * 60 * 1000, Math.floor(n));
+    }
+
+    function runCallback(entry) {
+      if (typeof entry.cb !== "function") return;
+      try {
+        entry.cb(...entry.args);
+      } catch (_err) {
+      }
+    }
+
+    function scheduleHostTimer(localId) {
+      const entry = active.get(localId);
+      if (!entry) return;
+
+      const raw = globalThis.__timer_start_evented(entry.delayMs);
+      const started = JSON.parse(raw);
+      if (!started || started.ok !== true) {
+        throw new TypeError((started && started.error) || "timer start 失败");
+      }
+
+      const hostId = Number(started.id);
+      if (!Number.isFinite(hostId) || hostId <= 0) {
+        throw new TypeError("timer id 非法");
+      }
+
+      entry.hostId = hostId;
+      hostToLocal.set(hostId, localId);
+    }
+
+    globalThis.__host_runtime_timer_complete = function __host_runtime_timer_complete(hostId, payloadRaw) {
+      if (typeof prevTimerComplete === "function") {
+        try {
+          prevTimerComplete(hostId, payloadRaw);
+        } catch (_err) {
+        }
+      }
+
+      const hId = Number(hostId);
+      const localId = hostToLocal.get(hId);
+      if (localId === undefined) return;
+
+      hostToLocal.delete(hId);
+      const entry = active.get(localId);
+      if (!entry) return;
+
+      entry.hostId = null;
+      if (entry.kind === "timeout") {
+        active.delete(localId);
+        runCallback(entry);
+        return;
+      }
+
+      runCallback(entry);
+      if (!active.has(localId) || !hasHostTimer()) return;
+
+      try {
+        scheduleHostTimer(localId);
+      } catch (_err) {
+        active.delete(localId);
+      }
+    };
+
+    globalThis.setTimeout = function setTimeout(cb, ms, ...args) {
       const id = timerId;
       timerId += 1;
-      active.set(id, true);
+      const entry = {
+        kind: "timeout",
+        cb,
+        args,
+        delayMs: normalizeDelay(ms),
+        hostId: null,
+      };
+      active.set(id, entry);
+
+      if (hasHostTimer()) {
+        try {
+          scheduleHostTimer(id);
+        } catch (err) {
+          active.delete(id);
+          throw err;
+        }
+        return id;
+      }
+
       __web.nextTick(() => {
         if (!active.get(id)) return;
         active.delete(id);
-        if (typeof cb === "function") cb(...args);
+        runCallback(entry);
       });
       return id;
     };
 
     globalThis.clearTimeout = function clearTimeout(id) {
-      active.delete(Number(id));
+      const localId = Number(id);
+      const entry = active.get(localId);
+      if (!entry) return;
+
+      active.delete(localId);
+      if (!hasHostTimer() || entry.hostId === null || entry.hostId === undefined) return;
+
+      const hostId = Number(entry.hostId);
+      hostToLocal.delete(hostId);
+      try {
+        globalThis.__timer_drop_evented(hostId);
+      } catch (_err) {
+      }
     };
 
-    globalThis.setInterval = function setInterval(cb, _ms, ...args) {
+    globalThis.setInterval = function setInterval(cb, ms, ...args) {
       const id = timerId;
       timerId += 1;
-      active.set(id, true);
+
+      const entry = {
+        kind: "interval",
+        cb,
+        args,
+        delayMs: normalizeDelay(ms),
+        hostId: null,
+      };
+      active.set(id, entry);
+
+      if (hasHostTimer()) {
+        try {
+          scheduleHostTimer(id);
+        } catch (err) {
+          active.delete(id);
+          throw err;
+        }
+        return id;
+      }
 
       const tick = () => {
-        if (!active.get(id)) return;
-        if (typeof cb === "function") cb(...args);
+        const current = active.get(id);
+        if (!current) return;
+        runCallback(current);
         __web.nextTick(tick);
       };
 
@@ -52,7 +177,7 @@
     };
 
     globalThis.clearInterval = function clearInterval(id) {
-      active.delete(Number(id));
+      globalThis.clearTimeout(id);
     };
 
     globalThis.setImmediate = function setImmediate(cb, ...args) {

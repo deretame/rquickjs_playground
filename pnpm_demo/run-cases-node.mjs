@@ -15,7 +15,7 @@ import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { tmpdir } from "node:os";
 
-const caseNames = ["fetch", "xhr", "axios", "fs", "native", "runtime", "runtime_api", "wasi", "cache", "bridge"];
+const caseNames = ["fetch", "axios", "fs", "native", "runtime", "runtime_api", "wasi", "cache", "bridge"];
 
 function toUint8Array(input) {
   if (input instanceof Uint8Array) return new Uint8Array(input);
@@ -26,42 +26,17 @@ function toUint8Array(input) {
   throw new TypeError("input must be Uint8Array/ArrayBuffer");
 }
 
-function createXmlHttpRequest() {
-  return class XMLHttpRequest {
-    constructor() {
-      this.status = 0;
-      this.responseText = "";
-      this.onload = null;
-      this.onerror = null;
-      this._method = "GET";
-      this._url = "";
-    }
-
-    open(method, url) {
-      this._method = String(method || "GET").toUpperCase();
-      this._url = String(url);
-    }
-
-    async send(body) {
-      try {
-        const res = await fetch(this._url, {
-          method: this._method,
-          body: body === undefined ? undefined : body,
-        });
-        this.status = Number(res.status || 0);
-        this.responseText = await res.text();
-        if (typeof this.onload === "function") this.onload();
-      } catch (err) {
-        if (typeof this.onerror === "function") this.onerror(err);
-      }
-    }
-  };
-}
-
 async function startTestServer() {
   const server = createServer(async (req, res) => {
     const method = String(req.method || "GET");
     const path = String(req.url || "/");
+    if (path === "/axios-binary") {
+      res.statusCode = 200;
+      res.setHeader("content-type", "application/octet-stream");
+      res.setHeader("connection", "close");
+      res.end(Buffer.from([0, 1, 2, 3, 250, 251, 252, 253, 254, 255]));
+      return;
+    }
     const headers = Object.fromEntries(
       Object.entries(req.headers).map(([k, v]) => [k.toLowerCase(), Array.isArray(v) ? v.join(",") : String(v ?? "")]),
     );
@@ -333,7 +308,6 @@ function createRuntimeAdapters() {
         rm,
       },
     },
-    XMLHttpRequest: createXmlHttpRequest(),
     cache,
     bridge,
     nodeCryptoCompat: {

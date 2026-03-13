@@ -5,22 +5,30 @@ export default async function main() {
     : (...parts: string[]) => parts.join("/").replace(/\/+/g, "/").replace("/images/../", "/");
   const joined = joinPath("/demo", "images", "..", "out.png");
 
-  const persistentStoreApi = (globalThis as unknown as {
-    persistentStore?: {
-      flushPersistentStore?: (key: string, value: string) => Promise<string>;
-      loadPersistentStore?: (key: string, value: string) => Promise<string>;
+  const pluginConfigApi = (globalThis as unknown as {
+    pluginConfig?: {
+      savePluginConfig?: (key: string, value: string) => Promise<string>;
+      loadPluginConfig?: (key: string, value: string) => Promise<string>;
     };
-  }).persistentStore;
+  }).pluginConfig;
 
-  let persistentStoreExample: unknown = null;
+  let pluginConfigExample: unknown = null;
   if (
-    persistentStoreApi
-    && typeof persistentStoreApi.flushPersistentStore === "function"
-    && typeof persistentStoreApi.loadPersistentStore === "function"
+    pluginConfigApi
+    && typeof pluginConfigApi.savePluginConfig === "function"
+    && typeof pluginConfigApi.loadPluginConfig === "function"
   ) {
-    await persistentStoreApi.flushPersistentStore("demo.token", "abc123");
-    const loaded = await persistentStoreApi.loadPersistentStore("demo.token", "");
-    persistentStoreExample = { key: "demo.token", loadedRaw: loaded };
+    try {
+      await pluginConfigApi.savePluginConfig("demo.token", "abc123");
+      const loaded = await pluginConfigApi.loadPluginConfig("demo.token", "");
+      pluginConfigExample = { key: "demo.token", loadedRaw: loaded };
+    } catch (err: unknown) {
+      pluginConfigExample = {
+        key: "demo.token",
+        skipped: true,
+        reason: err instanceof Error ? err.message : String(err),
+      };
+    }
   }
 
   if (!globalThis.native || !globalThis.wasi) {
@@ -28,7 +36,7 @@ export default async function main() {
       ok: true,
       runtime: "node",
       joined,
-      persistentStoreExample,
+      pluginConfigExample,
       note: "native/wasi 不存在，走 Node 回退路径",
     };
   }
@@ -52,7 +60,7 @@ export default async function main() {
   return {
     ok: true,
     joined,
-    persistentStoreExample,
+    pluginConfigExample,
     out: Array.from(out),
     wasi: {
       exitCode: run.exitCode,

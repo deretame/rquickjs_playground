@@ -65,6 +65,21 @@
         return Promise.reject(new TypeError("Body 已被读取"));
       }
       this.bodyUsed = true;
+      if (this.offloaded === true && this.nativeBufferId !== null && this.nativeBufferId !== undefined) {
+        if (!globalThis.native || typeof globalThis.native.take !== "function") {
+          return Promise.reject(new TypeError("native.take 不可用，无法读取 offload 二进制数据"));
+        }
+        const id = Number(this.nativeBufferId);
+        this.nativeBufferId = null;
+        return globalThis.native.take(id).then((bytes) => {
+          if (typeof TextDecoder === "function") {
+            return new TextDecoder("utf-8").decode(bytes);
+          }
+          let text = "";
+          for (let i = 0; i < bytes.length; i += 1) text += String.fromCharCode(bytes[i]);
+          return text;
+        });
+      }
       return Promise.resolve(this._bodyText);
     }
 
@@ -77,7 +92,31 @@
     }
 
     arrayBuffer() {
-      return this._consumeBody().then((text) => stringToArrayBuffer(text));
+      if (this.bodyUsed) {
+        return Promise.reject(new TypeError("Body 已被读取"));
+      }
+      if (this.offloaded === true && this.nativeBufferId !== null && this.nativeBufferId !== undefined) {
+        if (!globalThis.native || typeof globalThis.native.take !== "function") {
+          return Promise.reject(new TypeError("native.take 不可用，无法读取 offload 二进制数据"));
+        }
+        this.bodyUsed = true;
+        const id = Number(this.nativeBufferId);
+        this.nativeBufferId = null;
+        return globalThis.native.take(id).then((bytes) => {
+          const out = new Uint8Array(bytes.length);
+          out.set(bytes);
+          return out.buffer;
+        });
+      }
+      return this._consumeBody().then((text) => {
+        if (typeof TextEncoder === "function") {
+          const bytes = new TextEncoder().encode(text);
+          const out = new Uint8Array(bytes.length);
+          out.set(bytes);
+          return out.buffer;
+        }
+        return stringToArrayBuffer(text);
+      });
     }
   }
 
@@ -148,6 +187,9 @@
     clone() {
       if (this.bodyUsed) {
         throw new TypeError("Body 已被读取，无法 clone");
+      }
+      if (this.offloaded && this.nativeBufferId !== null) {
+        throw new TypeError("offload 响应暂不支持 clone");
       }
       return new Response(this._bodyText, {
         status: this.status,

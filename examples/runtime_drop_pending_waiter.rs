@@ -5,7 +5,7 @@ use std::time::Duration;
 use rquickjs_playground::AsyncHostRuntime;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let runtime = AsyncHostRuntime::new(false, "example-runtime-drop")?;
+    let runtime = AsyncHostRuntime::new("example-runtime-drop")?;
 
     let handle = runtime.spawn(
         r#"
