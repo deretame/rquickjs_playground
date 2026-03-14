@@ -104,9 +104,15 @@ export interface BridgeApi {
   call(name: string, ...args: unknown[]): Promise<unknown>;
 }
 
-export interface PluginConfigApi {
+export interface HostPluginConfigApi {
   savePluginConfig(key: string, value: string): Promise<string>;
   loadPluginConfig(key: string, value: string): Promise<string>;
+}
+
+export interface HostRuntimeApi {
+  bridge: BridgeApi;
+  pluginConfig: HostPluginConfigApi;
+  [key: string]: unknown;
 }
 
 export interface CryptoHash {
@@ -151,6 +157,7 @@ export interface PluginApi {
 }
 
 declare global {
+  var __web: RuntimeApi;
   var fs: FsApi | undefined;
   var path: PathApi | undefined;
   var plugin: PluginApi | undefined;
