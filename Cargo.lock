@@ -2141,6 +2141,7 @@ dependencies = [
  "base64",
  "ecb",
  "filetime",
+ "flate2",
  "getrandom 0.3.4",
  "hmac",
  "md5",

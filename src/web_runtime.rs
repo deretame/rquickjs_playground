@@ -3,6 +3,9 @@ use anyhow::{Context as AnyhowContext, Result as AnyResult, anyhow};
 use base64::Engine as Base64Engine;
 use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE as BASE64_URL_SAFE};
 use ecb::cipher::{BlockDecryptMut, KeyInit, block_padding::Pkcs7};
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use serde::Deserialize;
 use serde_json::Map;
 use serde_json::{Value, json};
@@ -10,6 +13,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fs;
 use std::io;
+use std::io::Read;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -2026,6 +2030,23 @@ fn native_apply_op(
             Ok(bytes)
         }
         "noop" => Ok(bytes),
+        "gzip_decompress" => {
+            let mut decoder = GzDecoder::new(bytes.as_slice());
+            let mut out = Vec::new();
+            decoder
+                .read_to_end(&mut out)
+                .map_err(|e| format!("gzip 解压失败: {e}"))?;
+            Ok(out)
+        }
+        "gzip_compress" => {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder
+                .write_all(&bytes)
+                .map_err(|e| format!("gzip 压缩失败: {e}"))?;
+            encoder
+                .finish()
+                .map_err(|e| format!("gzip 压缩失败: {e}"))
+        }
         _ => Err(format!("不支持的 native op: {op}")),
     }
 }
@@ -2791,6 +2812,20 @@ fn crypto_aes_ecb_pkcs7_decrypt_b64(payload_b64: String, key_raw: String) -> Any
     Ok(json!(text))
 }
 
+fn compression_gzip_decompress(input: Vec<u8>) -> AnyResult<Value> {
+    let mut decoder = GzDecoder::new(input.as_slice());
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).context("gzip 解压失败")?;
+    Ok(json!(out))
+}
+
+fn compression_gzip_compress(input: Vec<u8>) -> AnyResult<Value> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&input).context("gzip 压缩失败")?;
+    let out = encoder.finish().context("gzip 压缩失败")?;
+    Ok(json!(out))
+}
+
 fn bridge_call_inner(
     runtime_name: String,
     name: String,
@@ -2843,6 +2878,14 @@ fn bridge_call_inner(
             let payload_b64 = require_str_arg(&args, 0, "payloadB64")?;
             let key_raw = require_str_arg(&args, 1, "keyRaw")?;
             crypto_aes_ecb_pkcs7_decrypt_b64(payload_b64, key_raw)
+        }
+        "compression.gzip_decompress" => {
+            let input = parse_u8_json_value(require_arg(&args, 0, "input")?)?;
+            compression_gzip_decompress(input)
+        }
+        "compression.gzip_compress" => {
+            let input = parse_u8_json_value(require_arg(&args, 0, "input")?)?;
+            compression_gzip_compress(input)
         }
         "save_plugin_config" | "plugin_config.save_plugin_config" => {
             let key = require_str_arg(&args, 0, "key")?;

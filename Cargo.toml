@@ -41,6 +41,7 @@ sha2 = "0.10.9"
 md5 = "0.8.0"
 aes = "0.8.4"
 ecb = "0.1.2"
+flate2 = "1.1.2"
 wasmtime = "42.0.1"
 wasmtime-wasi = "42.0.1"
 

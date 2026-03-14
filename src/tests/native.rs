@@ -165,6 +165,47 @@ fn native_run_invert_min_copy_api() {
 }
 
 #[test]
+fn native_gzip_decompress_api() {
+    let script = r#"
+      (async () => {
+        const gz = new Uint8Array([
+          31,139,8,0,0,0,0,0,2,255,203,72,205,201,201,87,
+          72,175,202,44,0,0,25,106,210,223,10,0,0,0
+        ]);
+        const out = await native.gzipDecompress(gz);
+        const text = new TextDecoder().decode(out);
+        return JSON.stringify({ text, len: out.length });
+      })()
+    "#;
+
+    let result = run_async_script(script).expect("执行脚本失败");
+    let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
+    assert_eq!(parsed["text"], "hello gzip");
+    assert_eq!(parsed["len"], 10);
+}
+
+#[test]
+fn native_gzip_compress_and_decompress_api() {
+    let script = r#"
+      (async () => {
+        const input = new TextEncoder().encode("hello gzip");
+        const gz = await native.gzipCompress(input);
+        const out = await native.gzipDecompress(gz);
+        const text = new TextDecoder().decode(out);
+        return JSON.stringify({
+          text,
+          gzipMagic: gz.length >= 2 && gz[0] === 31 && gz[1] === 139
+        });
+      })()
+    "#;
+
+    let result = run_async_script(script).expect("执行脚本失败");
+    let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
+    assert_eq!(parsed["text"], "hello gzip");
+    assert_eq!(parsed["gzipMagic"], true);
+}
+
+#[test]
 fn native_handle_chain_grayscale() {
     let script = r#"
       (async () => {
@@ -528,4 +569,45 @@ fn bridge_call_by_function_name_with_args() {
     assert_eq!(parsed["out"][1], 253);
     assert_eq!(parsed["out"][2], 252);
     assert_eq!(parsed["sum"], 3.5);
+}
+
+#[test]
+fn bridge_call_gzip_decompress() {
+    let script = r#"
+      (async () => {
+        const gz = new Uint8Array([
+          31,139,8,0,0,0,0,0,2,255,203,72,205,201,201,87,
+          72,175,202,44,0,0,25,106,210,223,10,0,0,0
+        ]);
+        const bytes = await bridge.gzipDecompress(gz);
+        const text = new TextDecoder().decode(bytes);
+        return JSON.stringify({ text, len: bytes.length });
+      })()
+    "#;
+
+    let result = run_async_script(script).expect("执行脚本失败");
+    let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
+    assert_eq!(parsed["text"], "hello gzip");
+    assert_eq!(parsed["len"], 10);
+}
+
+#[test]
+fn bridge_call_gzip_compress_and_decompress() {
+    let script = r#"
+      (async () => {
+        const input = new TextEncoder().encode("hello gzip");
+        const gz = await bridge.gzipCompress(input);
+        const out = await bridge.gzipDecompress(gz);
+        const text = new TextDecoder().decode(out);
+        return JSON.stringify({
+          text,
+          gzipMagic: gz.length >= 2 && gz[0] === 31 && gz[1] === 139
+        });
+      })()
+    "#;
+
+    let result = run_async_script(script).expect("执行脚本失败");
+    let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
+    assert_eq!(parsed["text"], "hello gzip");
+    assert_eq!(parsed["gzipMagic"], true);
 }

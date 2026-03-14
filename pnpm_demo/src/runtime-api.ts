@@ -3,9 +3,9 @@ import type {
   CacheApi,
   CryptoApi,
   FsApi,
+  HostPluginConfigApi,
   NativeApi,
   PathApi,
-  PluginConfigApi,
   PluginApi,
   WasiApi,
 } from "../types/runtime-globals";
@@ -23,7 +23,7 @@ export interface RuntimeApiSet {
   wasi: WasiApi;
   cache: CacheApi;
   bridge: BridgeApi;
-  pluginConfig: PluginConfigApi;
+  pluginConfig: HostPluginConfigApi;
   plugin: PluginApi;
   path: PathApi;
   URL: typeof URL;
@@ -46,24 +46,34 @@ type RuntimeGlobal = typeof globalThis & Partial<RuntimeApiSet>;
 
 function isCryptoApi(value: unknown): value is CryptoApi {
   if (!value || typeof value !== "object") return false;
-  const candidate = value as { createHash?: unknown; createHmac?: unknown; randomBytes?: unknown };
+  const candidate = value as {
+    createHash?: unknown;
+    createHmac?: unknown;
+    randomBytes?: unknown;
+  };
   return (
-    typeof candidate.createHash === "function"
-    && typeof candidate.createHmac === "function"
-    && typeof candidate.randomBytes === "function"
+    typeof candidate.createHash === "function" &&
+    typeof candidate.createHmac === "function" &&
+    typeof candidate.randomBytes === "function"
   );
 }
 
-function readGlobal<K extends RuntimeApiName>(name: K): RuntimeApiSet[K] | undefined {
+function readGlobal<K extends RuntimeApiName>(
+  name: K,
+): RuntimeApiSet[K] | undefined {
   const g = globalThis as RuntimeGlobal;
   return g[name] as RuntimeApiSet[K] | undefined;
 }
 
-export function getApi<K extends RuntimeApiName>(name: K): RuntimeApiSet[K] | undefined {
+export function getApi<K extends RuntimeApiName>(
+  name: K,
+): RuntimeApiSet[K] | undefined {
   return readGlobal(name);
 }
 
-export function requireApi<K extends RuntimeApiName>(name: K): RuntimeApiSet[K] {
+export function requireApi<K extends RuntimeApiName>(
+  name: K,
+): RuntimeApiSet[K] {
   const value = readGlobal(name);
   if (value === undefined || value === null) {
     throw new TypeError(`runtime API 不可用: ${String(name)}`);
@@ -122,30 +132,82 @@ export function getRuntimeApis(): Partial<RuntimeApiSet> {
 }
 
 export const runtime = {
-  get Headers() { return requireApi("Headers"); },
-  get AbortController() { return requireApi("AbortController"); },
-  get AbortSignal() { return requireApi("AbortSignal"); },
-  get Request() { return requireApi("Request"); },
-  get Response() { return requireApi("Response"); },
-  get fetch() { return requireApi("fetch"); },
-  get fs() { return requireApi("fs"); },
-  get FSError() { return requireApi("FSError"); },
-  get native() { return requireApi("native"); },
-  get wasi() { return requireApi("wasi"); },
-  get cache() { return requireApi("cache"); },
-  get bridge() { return requireApi("bridge"); },
-  get pluginConfig() { return requireApi("pluginConfig"); },
-  get plugin() { return requireApi("plugin"); },
-  get path() { return requireApi("path"); },
-  get URL() { return requireApi("URL"); },
-  get URLSearchParams() { return requireApi("URLSearchParams"); },
-  get Blob() { return requireApi("Blob"); },
-  get File() { return requireApi("File"); },
-  get FormData() { return requireApi("FormData"); },
-  get crypto() { return requireCryptoLike(); },
-  get uuidv4() { return requireApi("uuidv4"); },
-  get TextEncoder() { return requireApi("TextEncoder"); },
-  get TextDecoder() { return requireApi("TextDecoder"); },
-  get Buffer() { return requireApi("Buffer"); },
-  get console() { return requireApi("console"); },
+  get Headers() {
+    return requireApi("Headers");
+  },
+  get AbortController() {
+    return requireApi("AbortController");
+  },
+  get AbortSignal() {
+    return requireApi("AbortSignal");
+  },
+  get Request() {
+    return requireApi("Request");
+  },
+  get Response() {
+    return requireApi("Response");
+  },
+  get fetch() {
+    return requireApi("fetch");
+  },
+  get fs() {
+    return requireApi("fs");
+  },
+  get FSError() {
+    return requireApi("FSError");
+  },
+  get native() {
+    return requireApi("native");
+  },
+  get wasi() {
+    return requireApi("wasi");
+  },
+  get cache() {
+    return requireApi("cache");
+  },
+  get bridge() {
+    return requireApi("bridge");
+  },
+  get pluginConfig() {
+    return requireApi("pluginConfig");
+  },
+  get plugin() {
+    return requireApi("plugin");
+  },
+  get path() {
+    return requireApi("path");
+  },
+  get URL() {
+    return requireApi("URL");
+  },
+  get URLSearchParams() {
+    return requireApi("URLSearchParams");
+  },
+  get Blob() {
+    return requireApi("Blob");
+  },
+  get File() {
+    return requireApi("File");
+  },
+  get FormData() {
+    return requireApi("FormData");
+  },
+  get crypto() {
+    return requireCryptoLike();
+  },
+  get uuidv4() {
+    return requireApi("uuidv4");
+  },
+  get TextEncoder() {
+    return requireApi("TextEncoder");
+  },
+  get TextDecoder() {
+    return requireApi("TextDecoder");
+  },
+  get Buffer() {
+    return requireApi("Buffer");
+  },
+  get console() {
+    return requireApi("console");
+  },
 };

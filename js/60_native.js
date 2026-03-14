@@ -126,6 +126,14 @@
     return take(outId);
   }
 
+  async function gzipDecompress(input) {
+    return run("gzip_decompress", input);
+  }
+
+  async function gzipCompress(input) {
+    return run("gzip_compress", input);
+  }
+
   globalThis.__web.native = {
     supportsBinaryBridge:
       typeof globalThis.__native_buffer_put_raw === "function"
@@ -138,5 +146,7 @@
     free,
     run,
     chain,
+    gzipDecompress,
+    gzipCompress,
   };
 })();
