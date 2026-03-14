@@ -3,6 +3,7 @@ pub mod web_runtime;
 
 pub use host_runtime::{
     AsyncHostRuntime, RuntimeJsonTaskHandle, RuntimeTaskHandle, RuntimeTaskStats,
+    configure_js_error_stack, js_error_stack_enabled,
 };
 pub use web_runtime::{
     HttpClientConfig, configure_http_client, current_http_client_config,

@@ -129,16 +129,22 @@
         this.method = input.method;
         this.headers = new Headers(input.headers);
         this._initBody(input._bodyText);
+        this.timeout = input.timeout;
+        this.signal = input.signal || null;
       } else {
         this.url = String(input);
         this.method = "GET";
         this.headers = new Headers();
         this._initBody("");
+        this.timeout = null;
+        this.signal = null;
       }
 
       this.method = normalizeMethod(init.method || this.method);
       if (init.headers) this.headers = new Headers(init.headers);
-      this.signal = init.signal || null;
+      if (Object.prototype.hasOwnProperty.call(init, "signal")) {
+        this.signal = init.signal || null;
+      }
       this.credentials = init.credentials || "same-origin";
       this.mode = init.mode || null;
       this.redirect = init.redirect || "follow";
@@ -147,6 +153,12 @@
       this.integrity = init.integrity || "";
       this.keepalive = Boolean(init.keepalive);
       this.cache = init.cache || "default";
+
+      if (Object.prototype.hasOwnProperty.call(init, "timeout") || Object.prototype.hasOwnProperty.call(init, "timeoutMs")) {
+        const timeoutRaw = Object.prototype.hasOwnProperty.call(init, "timeoutMs") ? init.timeoutMs : init.timeout;
+        const timeout = Number(timeoutRaw);
+        this.timeout = Number.isFinite(timeout) && timeout > 0 ? Math.floor(timeout) : null;
+      }
 
       const bodyInit = parseBodyInit(init.body);
       if (bodyInit.bodyText !== undefined) {
@@ -241,10 +253,34 @@
     return new Promise((resolve, reject) => {
       let requestId = null;
       let settled = false;
+      let timeoutId = null;
+      let timeoutFired = false;
+      let signal = request.signal;
+      let cleanupRequestSignal = null;
+      let cleanupSignal = null;
+
+      const clearTimeoutIfNeeded = () => {
+        if (timeoutId === null) return;
+        clearTimeout(timeoutId);
+        timeoutId = null;
+      };
+
+      const cleanupSignalListeners = () => {
+        if (typeof cleanupRequestSignal === "function") {
+          cleanupRequestSignal();
+          cleanupRequestSignal = null;
+        }
+        if (typeof cleanupSignal === "function") {
+          cleanupSignal();
+          cleanupSignal = null;
+        }
+      };
 
       const finish = (cb) => {
         if (settled) return;
         settled = true;
+        clearTimeoutIfNeeded();
+        cleanupSignalListeners();
         cb();
       };
 
@@ -256,11 +292,89 @@
         }
       };
 
+      const isTimeoutAbortReason = (reason) => {
+        if (timeoutFired) return true;
+        if (reason === null || reason === undefined) return false;
+
+        if (typeof reason === "string") {
+          const text = reason.toLowerCase();
+          return text.includes("timeout") || text.includes("超时");
+        }
+
+        if (typeof reason === "object") {
+          const name = String(reason.name || "");
+          const code = String(reason.code || "");
+          const message = String(reason.message || "").toLowerCase();
+          return (
+            name === "TimeoutError" ||
+            code === "ETIMEDOUT" ||
+            code === "ECONNABORTED" ||
+            message.includes("timeout") ||
+            message.includes("超时")
+          );
+        }
+
+        return false;
+      };
+
+      const buildAbortError = () => {
+        const reason = signal ? signal.reason : null;
+        const isTimeout = isTimeoutAbortReason(reason);
+
+        let message = isTimeout ? "请求超时" : "请求已取消";
+        if (typeof reason === "string" && reason.trim()) {
+          message = reason;
+        } else if (reason && typeof reason === "object") {
+          const reasonMessage = String(reason.message || "").trim();
+          if (reasonMessage) {
+            message = reasonMessage;
+          }
+        }
+
+        const err = new Error(message);
+        err.name = isTimeout ? "TimeoutError" : "AbortError";
+        return err;
+      };
+
+      if (request.timeout !== null) {
+        if (typeof AbortController === "function") {
+          const timeoutController = new AbortController();
+          const prevSignal = signal;
+          signal = timeoutController.signal;
+
+          if (prevSignal) {
+            const forwardAbort = () => {
+              timeoutController.abort(prevSignal.reason);
+            };
+            prevSignal.addEventListener("abort", forwardAbort);
+            cleanupRequestSignal = () => {
+              prevSignal.removeEventListener("abort", forwardAbort);
+            };
+
+            if (prevSignal.aborted) {
+              forwardAbort();
+            }
+          }
+
+          timeoutId = setTimeout(() => {
+            timeoutFired = true;
+            timeoutController.abort("请求超时");
+          }, request.timeout);
+        } else {
+          timeoutId = setTimeout(() => {
+            timeoutFired = true;
+            EVENTED_HTTP_PENDING.delete(requestId);
+            dropPending();
+            const timeoutErr = new Error("请求超时");
+            timeoutErr.name = "TimeoutError";
+            finish(() => reject(timeoutErr));
+          }, request.timeout);
+        }
+      }
+
       try {
-        if (request.signal && request.signal.aborted) {
-          const err = new Error(request.signal.reason || "请求已取消");
-          err.name = "AbortError";
-          finish(() => reject(err));
+        if (signal && signal.aborted) {
+          finish(() => reject(buildAbortError()));
           return;
         }
 
@@ -280,12 +394,18 @@
         const onAbort = () => {
           EVENTED_HTTP_PENDING.delete(requestId);
           dropPending();
-          const err = new Error(request.signal.reason || "请求已取消");
-          err.name = "AbortError";
-          finish(() => reject(err));
+          finish(() => reject(buildAbortError()));
         };
-        if (request.signal) {
-          request.signal.addEventListener("abort", onAbort);
+        if (signal) {
+          signal.addEventListener("abort", onAbort);
+          cleanupSignal = () => {
+            signal.removeEventListener("abort", onAbort);
+          };
+
+          if (signal.aborted) {
+            onAbort();
+            return;
+          }
         }
 
         EVENTED_HTTP_PENDING.set(requestId, {

@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::future::IntoFuture;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -26,7 +26,9 @@ const ASYNC_TASK_DISPATCHER_JS: &str = r#"(function () {
     } catch (err) {
       let __msg;
       try {
-        __msg = String(err && (err.stack || err.message) ? (err.stack || err.message) : err);
+        const __message = String(err && err.message ? err.message : err || "task eval error");
+        const __stack = String(err && err.stack ? err.stack : "");
+        __msg = __stack ? `${__message}\n${__stack}` : __message;
       } catch (_err) {
         __msg = "task eval error";
       }
@@ -54,7 +56,9 @@ const ASYNC_TASK_DISPATCHER_JS: &str = r#"(function () {
       (err) => {
         let __msg;
         try {
-          __msg = String(err && (err.stack || err.message) ? (err.stack || err.message) : err);
+          const __message = String(err && err.message ? err.message : err || "task rejected");
+          const __stack = String(err && err.stack ? err.stack : "");
+          __msg = __stack ? `${__message}\n${__stack}` : __message;
         } catch (_err) {
           __msg = "task rejected";
         }
@@ -148,6 +152,12 @@ const BUNDLE_DISPATCHER_JS: &str = r#"(async () => {
         const registry = ensureRegistry();
         return registry.delete(String(name));
       },
+      clearBundles() {
+        const registry = ensureRegistry();
+        const count = registry.size;
+        registry.clear();
+        return count;
+      },
       listBundles() {
         const registry = ensureRegistry();
         return Array.from(registry.keys()).map((v) => String(v));
@@ -171,7 +181,9 @@ const BUNDLE_DISPATCHER_JS: &str = r#"(async () => {
 
     return JSON.stringify({ ok: true, data: null });
   } catch (err) {
-    const message = String(err && (err.stack || err.message) ? (err.stack || err.message) : err);
+    const base = String(err && err.message ? err.message : err || "执行失败");
+    const stack = String(err && err.stack ? err.stack : "");
+    const message = stack ? `${base}\n${stack}` : base;
     return JSON.stringify({ ok: false, error: message });
   }
 })()"#;
@@ -254,6 +266,15 @@ enum TaskState {
 
 static ASYNC_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 static ASYNC_RUNTIME_SHARED: OnceLock<Mutex<HashMap<u64, Arc<RuntimeShared>>>> = OnceLock::new();
+static JS_ERROR_INCLUDE_STACK: AtomicBool = AtomicBool::new(true);
+
+pub fn configure_js_error_stack(include_stack: bool) {
+    JS_ERROR_INCLUDE_STACK.store(include_stack, Ordering::Relaxed);
+}
+
+pub fn js_error_stack_enabled() -> bool {
+    JS_ERROR_INCLUDE_STACK.load(Ordering::Relaxed)
+}
 
 struct RuntimeShared {
     states: Arc<Mutex<HashMap<u64, TaskState>>>,
@@ -558,7 +579,9 @@ impl AsyncHostRuntime {
                 host.loadBundle({name_literal}, {source_literal});
                 return JSON.stringify({{ ok: true, data: null }});
               }} catch (err) {{
-                const message = String(err && (err.stack || err.message) ? (err.stack || err.message) : err);
+                const base = String(err && err.message ? err.message : err || "执行失败");
+                const stack = String(err && err.stack ? err.stack : "");
+                const message = stack ? `${{base}}\n${{stack}}` : base;
                 return JSON.stringify({{ ok: false, error: message }});
               }}
             }})()
@@ -627,16 +650,43 @@ impl AsyncHostRuntime {
         let script = format!(
             r#"
             (async () => {{
+              const clearBundles = () => {{
+                const host = globalThis.__host_bundle_runtime;
+                if (!host) {{
+                  throw new Error("bundle dispatcher unavailable");
+                }}
+
+                if (typeof host.clearBundles === "function") {{
+                  host.clearBundles();
+                  return;
+                }}
+
+                if (typeof host.listBundles === "function" && typeof host.unloadBundle === "function") {{
+                  const names = host.listBundles();
+                  for (const name of names) host.unloadBundle(name);
+                  return;
+                }}
+
+                throw new Error("bundle clear unavailable");
+              }};
+
               try {{
                 const host = globalThis.__host_bundle_runtime;
                 if (!host || typeof host.callOnce !== "function") {{
                   throw new Error("bundle dispatcher unavailable");
                 }}
+                clearBundles();
                 const data = await host.callOnce({{ source: {source_literal}, fnPath: {fn_path_literal}, args: {args_literal} }});
                 return JSON.stringify({{ ok: true, data }});
               }} catch (err) {{
-                const message = String(err && (err.stack || err.message) ? (err.stack || err.message) : err);
+                const base = String(err && err.message ? err.message : err || "执行失败");
+                const stack = String(err && err.stack ? err.stack : "");
+                const message = stack ? `${{base}}\n${{stack}}` : base;
                 return JSON.stringify({{ ok: false, error: message }});
+              }} finally {{
+                try {{
+                  clearBundles();
+                }} catch (_err) {{}}
               }}
             }})()
             "#
@@ -667,7 +717,9 @@ impl AsyncHostRuntime {
                 const removed = host.unloadBundle({name_literal});
                 return JSON.stringify({{ ok: true, data: removed }});
               }} catch (err) {{
-                const message = String(err && (err.stack || err.message) ? (err.stack || err.message) : err);
+                const base = String(err && err.message ? err.message : err || "执行失败");
+                const stack = String(err && err.stack ? err.stack : "");
+                const message = stack ? `${{base}}\n${{stack}}` : base;
                 return JSON.stringify({{ ok: false, error: message }});
               }}
             }})()
@@ -696,7 +748,9 @@ impl AsyncHostRuntime {
                 const names = host.listBundles();
                 return JSON.stringify({ ok: true, data: names });
               } catch (err) {
-                const message = String(err && (err.stack || err.message) ? (err.stack || err.message) : err);
+                const base = String(err && err.message ? err.message : err || "执行失败");
+                const stack = String(err && err.stack ? err.stack : "");
+                const message = stack ? `${base}\n${stack}` : base;
                 return JSON.stringify({ ok: false, error: message });
               }
             })()
@@ -871,12 +925,35 @@ fn parse_ok_json_payload(raw: &str) -> Result<Value, String> {
     if payload.get("ok").and_then(Value::as_bool) == Some(true) {
         Ok(payload.get("data").cloned().unwrap_or(Value::Null))
     } else {
-        Err(payload
+        let raw_error = payload
             .get("error")
             .and_then(Value::as_str)
-            .unwrap_or("执行失败")
-            .to_string())
+            .unwrap_or("执行失败");
+        Err(format_js_error(raw_error))
     }
+}
+
+fn format_js_error(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "执行失败".to_string();
+    }
+
+    if js_error_stack_enabled() {
+        return trimmed.to_string();
+    }
+
+    for line in trimmed.lines() {
+        let text = line.trim();
+        if text.is_empty() {
+            continue;
+        }
+        if !text.starts_with("at ") {
+            return text.to_string();
+        }
+    }
+
+    trimmed.lines().next().unwrap_or(trimmed).trim().to_string()
 }
 
 fn build_bundle_call_script(name: &str, fn_path: &str, args: &Value) -> Result<String, String> {
@@ -898,7 +975,9 @@ fn build_bundle_call_script(name: &str, fn_path: &str, args: &Value) -> Result<S
             const data = await host.invoke({{ name: {name_literal}, fnPath: {fn_path_literal}, args: {args_literal} }});
             return JSON.stringify({{ ok: true, data }});
           }} catch (err) {{
-            const message = String(err && (err.stack || err.message) ? (err.stack || err.message) : err);
+            const base = String(err && err.message ? err.message : err || "执行失败");
+            const stack = String(err && err.stack ? err.stack : "");
+            const message = stack ? `${{base}}\n${{stack}}` : base;
             return JSON.stringify({{ ok: false, error: message }});
           }}
         }})()
