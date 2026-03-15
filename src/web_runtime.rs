@@ -228,6 +228,8 @@ static TIMER_STALE_DROPS: AtomicU64 = AtomicU64::new(0);
 static WASI_STALE_DROPS: AtomicU64 = AtomicU64::new(0);
 static CACHE_TX: OnceLock<mpsc::Sender<CacheCommand>> = OnceLock::new();
 static LOG_TX: OnceLock<mpsc::Sender<LogEvent>> = OnceLock::new();
+static LOG_HTTP_ENDPOINT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static LOG_HTTP_DIRECT_CLIENT: OnceLock<Client> = OnceLock::new();
 static LOG_ENQUEUED: AtomicU64 = AtomicU64::new(0);
 static LOG_WRITTEN: AtomicU64 = AtomicU64::new(0);
 static LOG_DROPPED: AtomicU64 = AtomicU64::new(0);
@@ -893,6 +895,79 @@ fn cache_sender() -> &'static mpsc::Sender<CacheCommand> {
 
 const LOG_MAX_PENDING: u64 = 16_384;
 
+fn log_http_endpoint_cell() -> &'static Mutex<Option<String>> {
+    LOG_HTTP_ENDPOINT.get_or_init(|| Mutex::new(None))
+}
+
+pub fn configure_log_http_endpoint(url: Option<String>) {
+    if let Ok(mut guard) = log_http_endpoint_cell().lock() {
+        *guard = url
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+    }
+}
+
+pub fn current_log_http_endpoint() -> Option<String> {
+    log_http_endpoint_cell()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
+fn log_http_direct_client() -> AnyResult<&'static Client> {
+    if let Some(client) = LOG_HTTP_DIRECT_CLIENT.get() {
+        return Ok(client);
+    }
+
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("创建日志直连 HTTP client 失败")?;
+
+    match LOG_HTTP_DIRECT_CLIENT.set(client) {
+        Ok(()) => Ok(LOG_HTTP_DIRECT_CLIENT
+            .get()
+            .expect("日志直连 HTTP client 初始化后必须可读取")),
+        Err(_client) => Ok(LOG_HTTP_DIRECT_CLIENT
+            .get()
+            .expect("日志直连 HTTP client 并发初始化后必须可读取")),
+    }
+}
+
+fn forward_log_event_if_needed(event: &LogEvent) {
+    let Some(url) = current_log_http_endpoint() else {
+        return;
+    };
+
+    let level = event.level.clone();
+    let message = event.message.clone();
+    let ts_ms = event.ts_ms;
+
+    let _ = host_async_runtime().spawn(async move {
+        let payload = json!({
+            "level": level,
+            "message": message,
+            "payload": {
+                "tsMs": ts_ms
+            }
+        });
+        if let Ok(client) = log_http_direct_client() {
+            if let Err(e) = client
+                .post(url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .json(&payload)
+                .send()
+                .await
+            {
+                tracing::debug!("[qjs-log-http] 转发失败: {e}");
+            }
+        } else {
+            tracing::debug!("[qjs-log-http] 日志直连 HTTP client 不可用，跳过日志转发");
+        }
+    });
+}
+
 fn log_sender() -> &'static mpsc::Sender<LogEvent> {
     LOG_TX.get_or_init(|| {
         let (tx, rx) = mpsc::channel::<LogEvent>();
@@ -909,6 +984,7 @@ fn log_sender() -> &'static mpsc::Sender<LogEvent> {
                         "debug" => tracing::debug!("{}", line),
                         _ => tracing::info!("{}", line),
                     }
+                    forward_log_event_if_needed(&event);
                     LOG_WRITTEN.fetch_add(1, Ordering::Relaxed);
                 }
             })
@@ -1784,6 +1860,7 @@ pub fn runtime_stats() -> String {
             "written": LOG_WRITTEN.load(Ordering::Relaxed),
             "dropped": LOG_DROPPED.load(Ordering::Relaxed),
             "errors": LOG_ERRORS.load(Ordering::Relaxed),
+            "httpEndpointConfigured": current_log_http_endpoint().is_some(),
         },
         "wasi": {
             "cacheSize": wasi_cache_size,

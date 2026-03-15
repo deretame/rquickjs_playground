@@ -242,6 +242,57 @@ fn async_runtime_handle_drop_cleans_pending_state() {
 }
 
 #[test]
+fn bundle_call_once_is_serialized_per_runtime() {
+    let runtime = Arc::new(
+        AsyncHostRuntime::new("task-runtime-bundle-call-once-serialized")
+            .expect("创建 AsyncHostRuntime 失败"),
+    );
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("创建 tokio runtime 失败");
+
+    let bundle_source = r#"
+      module.exports = {
+        async debugTask(name, delayMs) {
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+          return { ok: true, name, delayMs };
+        }
+      };
+    "#;
+
+    let elapsed = rt.block_on(async {
+        let t0 = Instant::now();
+        let rt1 = Arc::clone(&runtime);
+        let rt2 = Arc::clone(&runtime);
+
+        let task1 = tokio::spawn(async move {
+            rt1.bundle_call_once(bundle_source, "debugTask", &json!(["a", 80]))
+                .await
+        });
+        let task2 = tokio::spawn(async move {
+            rt2.bundle_call_once(bundle_source, "debugTask", &json!(["b", 80]))
+                .await
+        });
+
+        let out1 = task1.await.expect("task1 join 失败").expect("task1 执行失败");
+        let out2 = task2.await.expect("task2 join 失败").expect("task2 执行失败");
+
+        assert_eq!(out1["ok"], true);
+        assert_eq!(out2["ok"], true);
+
+        t0.elapsed()
+    });
+
+    assert!(
+        elapsed >= Duration::from_millis(140),
+        "bundle_call_once 未被串行化，耗时={}ms",
+        elapsed.as_millis()
+    );
+}
+
+#[test]
 fn async_runtime_drop_unblocks_pending_waiter() {
     let runtime = AsyncHostRuntime::new("task-runtime-drop-unblock")
         .expect("创建 AsyncHostRuntime 失败");

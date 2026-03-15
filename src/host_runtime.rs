@@ -208,6 +208,7 @@ pub struct AsyncHostRuntime {
     tx: mpsc::Sender<WorkerSignal>,
     states: Arc<Mutex<HashMap<u64, TaskState>>>,
     waiters: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<String, String>>>>>,
+    bundle_call_once_lock: Arc<tokio::sync::Mutex<()>>,
     next_id: AtomicU64,
 }
 
@@ -440,6 +441,7 @@ impl AsyncHostRuntime {
                 tx,
                 states,
                 waiters,
+                bundle_call_once_lock: Arc::new(tokio::sync::Mutex::new(())),
                 next_id: AtomicU64::new(1),
             }),
             Ok(Err(err)) => {
@@ -635,6 +637,7 @@ impl AsyncHostRuntime {
         fn_path: &str,
         args: &Value,
     ) -> Result<Value, String> {
+        let _once_guard = self.bundle_call_once_lock.lock().await;
         self.bundle_ensure_dispatcher().await?;
         if !args.is_array() {
             return Err("调用参数必须是 JSON 数组".to_string());

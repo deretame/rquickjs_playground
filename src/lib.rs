@@ -6,7 +6,8 @@ pub use host_runtime::{
     configure_js_error_stack, js_error_stack_enabled,
 };
 pub use web_runtime::{
-    HttpClientConfig, configure_http_client, current_http_client_config,
+    HttpClientConfig, configure_http_client, configure_log_http_endpoint,
+    current_http_client_config, current_log_http_endpoint,
     register_load_plugin_config_handler, register_save_plugin_config_handler,
 };
 

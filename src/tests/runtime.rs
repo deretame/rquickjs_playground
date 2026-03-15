@@ -1,11 +1,15 @@
 use crate::tests::run_async_script;
 use crate::web_runtime::{
-    plugin_call, plugin_get_info, plugin_list, plugin_load_bundle, WEB_POLYFILL,
+    configure_log_http_endpoint, plugin_call, plugin_get_info, plugin_list, plugin_load_bundle,
+    WEB_POLYFILL,
 };
 use rquickjs::{Context, Runtime};
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[test]
 fn runtime_timers_and_microtask() {
@@ -447,6 +451,95 @@ fn runtime_console_hook_emits_to_host_logger() {
     let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
     assert_eq!(parsed["hasConsole"], true);
     assert!(parsed["deltaEnqueued"].as_i64().unwrap_or(0) >= 3);
+}
+
+#[test]
+fn runtime_console_all_levels_forwarded_to_http_endpoint() {
+    use tiny_http::{Method, Response, Server};
+
+    configure_log_http_endpoint(None);
+
+    let server = Server::http("127.0.0.1:0").expect("启动测试服务失败");
+    let endpoint = format!("http://{}/log", server.server_addr());
+    let (tx, rx) = mpsc::channel::<Value>();
+
+    let marker = format!(
+        "debug-forward-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    );
+
+    let marker_for_thread = marker.clone();
+    let handle = thread::spawn(move || {
+        let mut matched = 0usize;
+        while matched < 3 {
+            match server.recv_timeout(Duration::from_secs(3)) {
+                Ok(Some(mut request)) => {
+                    let mut body = String::new();
+                    let _ = request.as_reader().read_to_string(&mut body);
+                    if request.method() == &Method::Post
+                        && request.url() == "/log"
+                        && body.contains(&marker_for_thread)
+                    {
+                        if let Ok(value) = serde_json::from_str::<Value>(&body) {
+                            let _ = tx.send(value);
+                            matched += 1;
+                        }
+                    }
+                    let _ = request.respond(Response::from_string("ok").with_status_code(200));
+                }
+                Ok(None) => {}
+                Err(_) => break,
+            }
+        }
+    });
+
+    configure_log_http_endpoint(Some(endpoint));
+
+    let script = format!(
+        r#"
+      (async () => {{
+        console.debug("{marker}-debug");
+        console.info("{marker}-info");
+        console.warn("{marker}-warn");
+        await new Promise((r) => setTimeout(r, 10));
+        await new Promise((r) => setTimeout(r, 10));
+        return JSON.stringify({{ ok: true }});
+      }})()
+    "#,
+    );
+
+    let _ = run_async_script(&script).expect("执行脚本失败");
+
+    let first = rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("未收到第 1 条日志回调");
+    let second = rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("未收到第 2 条日志回调");
+    let third = rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("未收到第 3 条日志回调");
+
+    configure_log_http_endpoint(None);
+    let _ = handle.join();
+
+    let mut levels = vec![
+        first["level"].as_str().unwrap_or_default().to_string(),
+        second["level"].as_str().unwrap_or_default().to_string(),
+        third["level"].as_str().unwrap_or_default().to_string(),
+    ];
+    levels.sort();
+
+    assert_eq!(
+        levels,
+        vec!["debug".to_string(), "info".to_string(), "warn".to_string()]
+    );
+    assert!(first["payload"]["tsMs"].is_number());
+    assert!(second["payload"]["tsMs"].is_number());
+    assert!(third["payload"]["tsMs"].is_number());
 }
 
 #[test]
