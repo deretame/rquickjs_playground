@@ -9,6 +9,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use tokio::sync::oneshot;
+use tokio::sync::OwnedMutexGuard;
 
 use crate::web_runtime::{
     WEB_POLYFILL, http_request_drop_evented, http_request_start_evented, install_host_bindings,
@@ -219,6 +220,7 @@ pub struct RuntimeTaskHandle {
     waiters: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<String, String>>>>>,
     tx: mpsc::Sender<WorkerSignal>,
     drop_cleanup: bool,
+    bundle_call_once_guard: Option<OwnedMutexGuard<()>>,
 }
 
 pub struct RuntimeJsonTaskHandle<T> {
@@ -229,6 +231,7 @@ pub struct RuntimeJsonTaskHandle<T> {
 enum AsyncCommand {
     Submit { id: u64, script: String },
     Drop { id: u64 },
+    DropMany { ids: Vec<u64> },
     Shutdown,
 }
 
@@ -499,6 +502,7 @@ impl AsyncHostRuntime {
             waiters: Arc::clone(&self.waiters),
             tx: self.tx.clone(),
             drop_cleanup: true,
+            bundle_call_once_guard: None,
         })
     }
 
@@ -520,6 +524,21 @@ impl AsyncHostRuntime {
         if self
             .tx
             .send(WorkerSignal::Command(AsyncCommand::Drop { id }))
+            .is_err()
+        {
+            return false;
+        }
+        true
+    }
+
+    pub fn cancel_many(&self, ids: Vec<u64>) -> bool {
+        if ids.is_empty() {
+            return true;
+        }
+
+        if self
+            .tx
+            .send(WorkerSignal::Command(AsyncCommand::DropMany { ids }))
             .is_err()
         {
             return false;
@@ -637,71 +656,33 @@ impl AsyncHostRuntime {
         fn_path: &str,
         args: &Value,
     ) -> Result<Value, String> {
-        let _once_guard = self.bundle_call_once_lock.lock().await;
+        let raw = self
+            .bundle_call_once_start(source, fn_path, args)
+            .await?
+            .wait_async()
+            .await
+            .map_err(|e| format!("执行一次性 bundle 调用失败: {e}"))?;
+        parse_ok_json_payload(&raw)
+    }
+
+    pub async fn bundle_call_once_start(
+        &self,
+        source: &str,
+        fn_path: &str,
+        args: &Value,
+    ) -> Result<RuntimeTaskHandle, String> {
+        let once_guard = self.bundle_call_once_lock.clone().lock_owned().await;
         self.bundle_ensure_dispatcher().await?;
         if !args.is_array() {
             return Err("调用参数必须是 JSON 数组".to_string());
         }
 
-        let source_literal = serde_json::to_string(source)
-            .map_err(|e| format!("序列化 bundle 脚本失败: {e}"))?;
-        let fn_path_literal =
-            serde_json::to_string(fn_path).map_err(|e| format!("序列化函数路径失败: {e}"))?;
-        let args_literal =
-            serde_json::to_string(args).map_err(|e| format!("序列化调用参数失败: {e}"))?;
-
-        let script = format!(
-            r#"
-            (async () => {{
-              const clearBundles = () => {{
-                const host = globalThis.__host_bundle_runtime;
-                if (!host) {{
-                  throw new Error("bundle dispatcher unavailable");
-                }}
-
-                if (typeof host.clearBundles === "function") {{
-                  host.clearBundles();
-                  return;
-                }}
-
-                if (typeof host.listBundles === "function" && typeof host.unloadBundle === "function") {{
-                  const names = host.listBundles();
-                  for (const name of names) host.unloadBundle(name);
-                  return;
-                }}
-
-                throw new Error("bundle clear unavailable");
-              }};
-
-              try {{
-                const host = globalThis.__host_bundle_runtime;
-                if (!host || typeof host.callOnce !== "function") {{
-                  throw new Error("bundle dispatcher unavailable");
-                }}
-                clearBundles();
-                const data = await host.callOnce({{ source: {source_literal}, fnPath: {fn_path_literal}, args: {args_literal} }});
-                return JSON.stringify({{ ok: true, data }});
-              }} catch (err) {{
-                const base = String(err && err.message ? err.message : err || "执行失败");
-                const stack = String(err && err.stack ? err.stack : "");
-                const message = stack ? `${{base}}\n${{stack}}` : base;
-                return JSON.stringify({{ ok: false, error: message }});
-              }} finally {{
-                try {{
-                  clearBundles();
-                }} catch (_err) {{}}
-              }}
-            }})()
-            "#
-        );
-
-        let raw = self
+        let script = build_bundle_call_once_script(source, fn_path, args)?;
+        let mut handle = self
             .spawn(script)
-            .map_err(|e| format!("执行一次性 bundle 调用失败: {e}"))?
-            .wait_async()
-            .await
             .map_err(|e| format!("执行一次性 bundle 调用失败: {e}"))?;
-        parse_ok_json_payload(&raw)
+        handle.bundle_call_once_guard = Some(once_guard);
+        Ok(handle)
     }
 
     pub async fn bundle_unload(&self, name: &str) -> Result<bool, String> {
@@ -920,6 +901,60 @@ where
             .map_err(|e| format!("解析 JSON 任务结果失败: {e}; payload={payload}")),
         Err(err) => Err(err),
     }
+}
+
+fn build_bundle_call_once_script(source: &str, fn_path: &str, args: &Value) -> Result<String, String> {
+    let source_literal =
+        serde_json::to_string(source).map_err(|e| format!("序列化 bundle 脚本失败: {e}"))?;
+    let fn_path_literal =
+        serde_json::to_string(fn_path).map_err(|e| format!("序列化函数路径失败: {e}"))?;
+    let args_literal =
+        serde_json::to_string(args).map_err(|e| format!("序列化调用参数失败: {e}"))?;
+
+    Ok(format!(
+        r#"
+        (async () => {{
+          const clearBundles = () => {{
+            const host = globalThis.__host_bundle_runtime;
+            if (!host) {{
+              throw new Error("bundle dispatcher unavailable");
+            }}
+
+            if (typeof host.clearBundles === "function") {{
+              host.clearBundles();
+              return;
+            }}
+
+            if (typeof host.listBundles === "function" && typeof host.unloadBundle === "function") {{
+              const names = host.listBundles();
+              for (const name of names) host.unloadBundle(name);
+              return;
+            }}
+
+            throw new Error("bundle clear unavailable");
+          }};
+
+          try {{
+            const host = globalThis.__host_bundle_runtime;
+            if (!host || typeof host.callOnce !== "function") {{
+              throw new Error("bundle dispatcher unavailable");
+            }}
+            clearBundles();
+            const data = await host.callOnce({{ source: {source_literal}, fnPath: {fn_path_literal}, args: {args_literal} }});
+            return JSON.stringify({{ ok: true, data }});
+          }} catch (err) {{
+            const base = String(err && err.message ? err.message : err || "执行失败");
+            const stack = String(err && err.stack ? err.stack : "");
+            const message = stack ? `${{base}}\n${{stack}}` : base;
+            return JSON.stringify({{ ok: false, error: message }});
+          }} finally {{
+            try {{
+              clearBundles();
+            }} catch (_err) {{}}
+          }}
+        }})()
+        "#
+    ))
 }
 
 fn parse_ok_json_payload(raw: &str) -> Result<Value, String> {
@@ -1169,6 +1204,12 @@ fn handle_worker_command(
         }
         AsyncCommand::Drop { id } => {
             mark_dropped_and_notify(states, waiters, id);
+            true
+        }
+        AsyncCommand::DropMany { ids } => {
+            for id in ids {
+                mark_dropped_and_notify(states, waiters, id);
+            }
             true
         }
         AsyncCommand::Shutdown => false,
