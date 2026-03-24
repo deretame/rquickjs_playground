@@ -3,9 +3,9 @@ use anyhow::{Context as AnyhowContext, Result as AnyResult, anyhow};
 use base64::Engine as Base64Engine;
 use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE as BASE64_URL_SAFE};
 use ecb::cipher::{BlockDecryptMut, KeyInit, block_padding::Pkcs7};
+use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
-use flate2::Compression;
 use serde::Deserialize;
 use serde_json::Map;
 use serde_json::{Value, json};
@@ -1012,9 +1012,7 @@ fn log_http_endpoint_cell() -> &'static Mutex<Option<String>> {
 
 pub fn configure_log_http_endpoint(url: Option<String>) {
     if let Ok(mut guard) = log_http_endpoint_cell().lock() {
-        *guard = url
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
+        *guard = url.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
     }
 }
 
@@ -1391,7 +1389,9 @@ where
     let task = host_async_runtime().spawn(async move {
         tokio::time::sleep(Duration::from_millis(normalized_delay_ms)).await;
         on_complete(id, json!({ "ok": true }).to_string());
-        let _ = timer_req_event_pool().lock().map(|mut pool| pool.remove(&id));
+        let _ = timer_req_event_pool()
+            .lock()
+            .map(|mut pool| pool.remove(&id));
     });
 
     {
@@ -2266,9 +2266,7 @@ fn native_apply_op(
             encoder
                 .write_all(&bytes)
                 .map_err(|e| format!("gzip 压缩失败: {e}"))?;
-            encoder
-                .finish()
-                .map_err(|e| format!("gzip 压缩失败: {e}"))
+            encoder.finish().map_err(|e| format!("gzip 压缩失败: {e}"))
         }
         _ => Err(format!("不支持的 native op: {op}")),
     }
@@ -3625,7 +3623,7 @@ pub fn fs_mkdtemp(prefix: String) -> String {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_else(|_| Duration::from_secs(0))
             .as_nanos();
-        let seq = MKDTEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let seq: u64 = MKDTEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let candidate = format!("{prefix}{ts:016x}{seq:04x}");
         let path = PathBuf::from(candidate);
         match fs::create_dir(&path) {
