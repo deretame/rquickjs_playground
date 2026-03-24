@@ -1,4 +1,6 @@
-use crate::tests::{ensure_pnpm_cases_built, run_async_script, spawn_test_server};
+use crate::tests::{
+    ensure_pnpm_cases_built, run_async_script, run_async_script_with_wasi, spawn_test_server,
+};
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
@@ -14,6 +16,10 @@ fn case_bundle_path(name: &str) -> PathBuf {
 }
 
 fn run_case(name: &str, config: Value) -> Value {
+    run_case_with_wasi(name, config, false)
+}
+
+fn run_case_with_wasi(name: &str, config: Value, wasi: bool) -> Value {
     ensure_pnpm_cases_built();
     let bundle = fs::read_to_string(case_bundle_path(name)).expect("读取 case bundle 失败");
     let bundle_json = serde_json::to_string(&bundle).expect("序列化 bundle 失败");
@@ -51,7 +57,12 @@ fn run_case(name: &str, config: Value) -> Value {
     "#
     );
 
-    let result = run_async_script(&script).expect("执行 bundle case 失败");
+    let result = if wasi {
+        run_async_script_with_wasi(&script)
+    } else {
+        run_async_script(&script)
+    }
+    .expect("执行 bundle case 失败");
 
     serde_json::from_str(&result).expect("解析 case 结果失败")
 }
@@ -151,14 +162,16 @@ fn compiled_runtime_case_runs() {
     assert_case_ok(&out);
 }
 
+#[cfg(feature = "wasi")]
 #[test]
 fn compiled_runtime_api_case_runs() {
     let (base_url, tx, handle) = spawn_test_server(2);
     let dir = unique_temp_dir();
     let base_dir = dir.to_string_lossy().replace('\\', "/");
-    let out = run_case(
+    let out = run_case_with_wasi(
         "runtime_api",
         serde_json::json!({ "baseDir": base_dir, "baseUrl": base_url }),
+        true,
     );
     assert_case_ok(&out);
     let _ = tx.send(());
@@ -166,9 +179,10 @@ fn compiled_runtime_api_case_runs() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[cfg(feature = "wasi")]
 #[test]
 fn compiled_wasi_case_runs() {
-    let out = run_case("wasi", serde_json::json!({}));
+    let out = run_case_with_wasi("wasi", serde_json::json!({}), true);
     assert_case_ok(&out);
 }
 

@@ -36,7 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-说明：`AsyncHostRuntime::new(cache_scope_id)` 的参数是实例级缓存作用域 id。宿主会在 Rust 侧自动把 cache key 前缀化，不需要在 JS 里手动拼接 runtime id。
+说明：`AsyncHostRuntime::new(cache_scope_id)` 默认不注入 `wasi`，而且默认构建也不会编译进 WASI 依赖。如果需要 `wasi`，请在 Cargo 里开启 `wasi` 特性，并改用 `AsyncHostRuntime::new_with_options(cache_scope_id, WebRuntimeOptions { wasi: true })`。宿主会在 Rust 侧自动把 cache key 前缀化，不需要在 JS 里手动拼接 runtime id。
 
 如果你想运行仓库里的演示：
 
@@ -116,6 +116,27 @@ const info = await native.takeInto(outId, target, 0);
 
 ### 3.2 options 说明
 
+要使用这一组 API，需要同时满足两件事：
+
+1. Cargo 开启 `wasi` 特性
+2. 创建运行时时显式开启 `wasi`
+
+```toml
+[dependencies]
+rquickjs_playground = { path = "../rquickjs_playground", features = ["wasi"] }
+```
+
+然后：
+
+```rust
+use rquickjs_playground::{AsyncHostRuntime, WebRuntimeOptions};
+
+let host = AsyncHostRuntime::new_with_options(
+    "demo-runtime",
+    WebRuntimeOptions { wasi: true },
+)?;
+```
+
 - `args?: string[]`
   - 传给 WASI 模块 argv（宿主会自动补 `module.wasm` 为 argv[0]）。
 - `stdinId?: number`
@@ -171,6 +192,12 @@ cargo build --target wasm32-wasip1 --release
 
 ```bash
 cargo test
+```
+
+如果你要跑包含 WASI 的测试：
+
+```bash
+cargo test --features wasi
 ```
 
 相关测试重点在：
@@ -393,15 +420,17 @@ Rust 侧用法：
 ```rust
 use rquickjs::{Context, Runtime};
 use rquickjs_playground::web_runtime::{
-    WEB_POLYFILL, plugin_call, plugin_get_info, plugin_load_bundle,
+    WEB_POLYFILL, WebRuntimeOptions, plugin_call, plugin_get_info, plugin_load_bundle,
+    polyfill_script,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = Runtime::new()?;
     let context = Context::full(&runtime)?;
+    let script = polyfill_script(WebRuntimeOptions::default());
 
     context.with(|ctx| {
-        ctx.eval::<(), _>(WEB_POLYFILL)?;
+        ctx.eval::<(), _>(script.as_str())?;
 
         plugin_load_bundle(
             &ctx,

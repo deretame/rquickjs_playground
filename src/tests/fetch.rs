@@ -1,7 +1,9 @@
 use crate::tests::{run_async_script, spawn_test_server};
 use serde_json::Value;
+#[cfg(feature = "wasi")]
 use wat::parse_str;
 
+#[cfg(feature = "wasi")]
 fn wasi_echo_stdin_module_bytes() -> Vec<u8> {
     parse_str(
         r#"
@@ -565,6 +567,7 @@ fn fetch_auto_offload_octet_stream_arraybuffer() {
     let _ = handle.join();
 }
 
+#[cfg(feature = "wasi")]
 #[test]
 fn fetch_offload_with_wasi_transform_success() {
     let (base_url, tx, handle) = spawn_test_server(2);
@@ -626,6 +629,7 @@ fn fetch_offload_with_wasi_transform_success() {
     let _ = handle.join();
 }
 
+#[cfg(feature = "wasi")]
 #[test]
 fn fetch_offload_with_wasi_transform_failure_fails_request() {
     let (base_url, tx, handle) = spawn_test_server(2);

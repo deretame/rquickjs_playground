@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::Map;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+#[cfg(feature = "wasi")]
 use std::collections::VecDeque;
 use std::fs;
 use std::io;
@@ -34,8 +35,56 @@ use tokio::runtime::{Builder as TokioRuntimeBuilder, Runtime as TokioRuntime};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+#[cfg(feature = "wasi")]
 use wasmtime::{Engine, Linker, Module, Store};
+#[cfg(feature = "wasi")]
 use wasmtime_wasi::WasiCtxBuilder;
+
+#[cfg(feature = "host-fs")]
+const WEB_POLYFILL_CORE: &str = concat!(
+    include_str!("../js/00_bootstrap.js"),
+    "\n",
+    include_str!("../js/10_headers.js"),
+    "\n",
+    include_str!("../js/20_abort.js"),
+    "\n",
+    include_str!("../js/30_fetch.js"),
+    "\n",
+    include_str!("../js/50_fs.js"),
+    "\n",
+    include_str!("../js/60_native.js"),
+    "\n",
+    include_str!("../js/62_bridge.js"),
+    "\n",
+    include_str!("../js/63_plugin.js"),
+    "\n",
+    include_str!("../js/64_cache.js"),
+    "\n",
+    include_str!("../js/65_console.js"),
+    "\n"
+);
+
+#[cfg(not(feature = "host-fs"))]
+const WEB_POLYFILL_CORE: &str = concat!(
+    include_str!("../js/00_bootstrap.js"),
+    "\n",
+    include_str!("../js/10_headers.js"),
+    "\n",
+    include_str!("../js/20_abort.js"),
+    "\n",
+    include_str!("../js/30_fetch.js"),
+    "\n",
+    include_str!("../js/60_native.js"),
+    "\n",
+    include_str!("../js/62_bridge.js"),
+    "\n",
+    include_str!("../js/63_plugin.js"),
+    "\n",
+    include_str!("../js/64_cache.js"),
+    "\n",
+    include_str!("../js/65_console.js"),
+    "\n"
+);
 
 #[cfg(feature = "host-fs")]
 pub const WEB_POLYFILL: &str = concat!(
@@ -50,8 +99,6 @@ pub const WEB_POLYFILL: &str = concat!(
     include_str!("../js/50_fs.js"),
     "\n",
     include_str!("../js/60_native.js"),
-    "\n",
-    include_str!("../js/61_wasi.js"),
     "\n",
     include_str!("../js/62_bridge.js"),
     "\n",
@@ -77,8 +124,6 @@ pub const WEB_POLYFILL: &str = concat!(
     "\n",
     include_str!("../js/60_native.js"),
     "\n",
-    include_str!("../js/61_wasi.js"),
-    "\n",
     include_str!("../js/62_bridge.js"),
     "\n",
     include_str!("../js/63_plugin.js"),
@@ -91,7 +136,35 @@ pub const WEB_POLYFILL: &str = concat!(
     "\n"
 );
 
-pub fn install_host_bindings(ctx: &Ctx<'_>, cache_scope_id: &str) -> Result<(), rquickjs::Error> {
+pub const WEB_WASI_POLYFILL: &str = concat!(include_str!("../js/61_wasi.js"), "\n");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WebRuntimeOptions {
+    pub wasi: bool,
+}
+
+pub fn polyfill_script(options: WebRuntimeOptions) -> String {
+    let mut script = String::from(WEB_POLYFILL_CORE);
+    if options.wasi && cfg!(feature = "wasi") {
+        script.push_str(WEB_WASI_POLYFILL);
+    }
+    script.push_str(include_str!("../js/99_exports.js"));
+    script.push('\n');
+    script
+}
+
+pub fn install_host_bindings(
+    ctx: &Ctx<'_>,
+    cache_scope_id: &str,
+    options: WebRuntimeOptions,
+) -> Result<(), rquickjs::Error> {
+    if options.wasi && !cfg!(feature = "wasi") {
+        return Err(rquickjs::Error::new_from_js_message(
+            "rust",
+            "runtime",
+            "当前构建未启用 wasi Cargo 特性",
+        ));
+    }
     let cache_scope_id = normalize_runtime_cache_scope_id(cache_scope_id);
     let globals = ctx.globals();
     globals.set("__http_request_start", Func::from(http_request_start))?;
@@ -117,9 +190,11 @@ pub fn install_host_bindings(ctx: &Ctx<'_>, cache_scope_id: &str) -> Result<(), 
             },
         )?,
     )?;
-    globals.set("__wasi_run_start", Func::from(wasi_run_start))?;
-    globals.set("__wasi_run_try_take", Func::from(wasi_run_try_take))?;
-    globals.set("__wasi_run_drop", Func::from(wasi_run_drop))?;
+    if options.wasi {
+        globals.set("__wasi_run_start", Func::from(wasi_run_start))?;
+        globals.set("__wasi_run_try_take", Func::from(wasi_run_try_take))?;
+        globals.set("__wasi_run_drop", Func::from(wasi_run_drop))?;
+    }
     let cache_scope_for_set = cache_scope_id.clone();
     globals.set(
         "__cache_set",
@@ -206,25 +281,37 @@ static FS_REQ_POOL: OnceLock<Mutex<HashMap<u64, PendingTask>>> = OnceLock::new()
 static FS_REQ_EVENT_POOL: OnceLock<Mutex<HashMap<u64, PendingAbortTask>>> = OnceLock::new();
 static TIMER_REQ_ID: AtomicU64 = AtomicU64::new(1);
 static TIMER_REQ_EVENT_POOL: OnceLock<Mutex<HashMap<u64, PendingAbortTask>>> = OnceLock::new();
+#[cfg(feature = "wasi")]
 static WASI_REQ_ID: AtomicU64 = AtomicU64::new(1);
+#[cfg(feature = "wasi")]
 static WASI_REQ_POOL: OnceLock<Mutex<HashMap<u64, PendingTask>>> = OnceLock::new();
+#[cfg(feature = "wasi")]
 static WASI_REQ_EVENT_POOL: OnceLock<Mutex<HashMap<u64, PendingAbortTask>>> = OnceLock::new();
+#[cfg(feature = "wasi")]
 static WASI_ENGINE: OnceLock<Engine> = OnceLock::new();
+#[cfg(feature = "wasi")]
 static WASI_MODULE_CACHE: OnceLock<Mutex<HashMap<Vec<u8>, Module>>> = OnceLock::new();
+#[cfg(feature = "wasi")]
 static WASI_MODULE_CACHE_ORDER: OnceLock<Mutex<VecDeque<Vec<u8>>>> = OnceLock::new();
+#[cfg(feature = "wasi")]
 static WASI_LINKER: OnceLock<Linker<wasmtime_wasi::p1::WasiP1Ctx>> = OnceLock::new();
+#[cfg(feature = "wasi")]
 static WASI_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "wasi")]
 static WASI_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "wasi")]
 static WASI_CACHE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 static HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 static HTTP_CLIENT_CONFIG: OnceLock<Mutex<HttpClientConfig>> = OnceLock::new();
 static HOST_ASYNC_RT: OnceLock<TokioRuntime> = OnceLock::new();
 static HTTP_IO_SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static FS_IO_SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
+#[cfg(feature = "wasi")]
 static WASI_IO_SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static HTTP_STALE_DROPS: AtomicU64 = AtomicU64::new(0);
 static FS_STALE_DROPS: AtomicU64 = AtomicU64::new(0);
 static TIMER_STALE_DROPS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "wasi")]
 static WASI_STALE_DROPS: AtomicU64 = AtomicU64::new(0);
 static CACHE_TX: OnceLock<mpsc::Sender<CacheCommand>> = OnceLock::new();
 static LOG_TX: OnceLock<mpsc::Sender<LogEvent>> = OnceLock::new();
@@ -377,26 +464,32 @@ fn timer_req_event_pool() -> &'static Mutex<HashMap<u64, PendingAbortTask>> {
     TIMER_REQ_EVENT_POOL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[cfg(feature = "wasi")]
 fn wasi_req_pool() -> &'static Mutex<HashMap<u64, PendingTask>> {
     WASI_REQ_POOL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[cfg(feature = "wasi")]
 fn wasi_req_event_pool() -> &'static Mutex<HashMap<u64, PendingAbortTask>> {
     WASI_REQ_EVENT_POOL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[cfg(feature = "wasi")]
 fn wasi_engine() -> &'static Engine {
     WASI_ENGINE.get_or_init(Engine::default)
 }
 
+#[cfg(feature = "wasi")]
 fn wasi_module_cache() -> &'static Mutex<HashMap<Vec<u8>, Module>> {
     WASI_MODULE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[cfg(feature = "wasi")]
 fn wasi_module_cache_order() -> &'static Mutex<VecDeque<Vec<u8>>> {
     WASI_MODULE_CACHE_ORDER.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
+#[cfg(feature = "wasi")]
 fn wasi_linker() -> AnyResult<&'static Linker<wasmtime_wasi::p1::WasiP1Ctx>> {
     if let Some(linker) = WASI_LINKER.get() {
         return Ok(linker);
@@ -435,6 +528,7 @@ fn fs_io_sem() -> &'static Arc<Semaphore> {
     FS_IO_SEM.get_or_init(|| Arc::new(Semaphore::new(FS_MAX_IN_FLIGHT)))
 }
 
+#[cfg(feature = "wasi")]
 fn wasi_io_sem() -> &'static Arc<Semaphore> {
     WASI_IO_SEM.get_or_init(|| Arc::new(Semaphore::new(WASI_MAX_IN_FLIGHT)))
 }
@@ -707,6 +801,7 @@ fn build_multipart_form(plan: HostFormDataPlan) -> AnyResult<MultipartForm> {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(not(feature = "wasi"), allow(dead_code))]
 struct WasiTransformPlan {
     module_id: u64,
     function: Option<String>,
@@ -715,6 +810,7 @@ struct WasiTransformPlan {
     output_type: String,
 }
 
+#[cfg(feature = "wasi")]
 fn parse_wasi_transform_plan(raw_b64: &str) -> AnyResult<WasiTransformPlan> {
     let raw = raw_b64.trim();
     let decoded = BASE64_URL_SAFE
@@ -726,6 +822,12 @@ fn parse_wasi_transform_plan(raw_b64: &str) -> AnyResult<WasiTransformPlan> {
         .context("解析 wasi transform plan JSON 失败")
 }
 
+#[cfg(not(feature = "wasi"))]
+fn parse_wasi_transform_plan(_raw_b64: &str) -> AnyResult<WasiTransformPlan> {
+    Err(anyhow!("当前构建未启用 wasi Cargo 特性"))
+}
+
+#[cfg(feature = "wasi")]
 fn build_wasi_argv_json(plan: &WasiTransformPlan) -> AnyResult<Option<String>> {
     let mut argv: Vec<String> = Vec::new();
     if let Some(function) = &plan.function {
@@ -745,6 +847,7 @@ fn build_wasi_argv_json(plan: &WasiTransformPlan) -> AnyResult<Option<String>> {
     }
 }
 
+#[cfg(feature = "wasi")]
 async fn run_wasi_transform_once(plan: &WasiTransformPlan, input: Vec<u8>) -> AnyResult<Vec<u8>> {
     if !plan.output_type.eq_ignore_ascii_case("binary") {
         return Err(anyhow!(
@@ -787,6 +890,14 @@ async fn run_wasi_transform_once(plan: &WasiTransformPlan, input: Vec<u8>) -> An
     let out =
         native_buffer_take_raw(stdout_id).ok_or_else(|| anyhow!("wasi stdout buffer 不存在"))?;
     Ok(out)
+}
+
+#[cfg(not(feature = "wasi"))]
+async fn run_wasi_transform_once(
+    _plan: &WasiTransformPlan,
+    _input: Vec<u8>,
+) -> AnyResult<Vec<u8>> {
+    Err(anyhow!("当前构建未启用 wasi Cargo 特性"))
 }
 
 fn cache_sender() -> &'static mpsc::Sender<CacheCommand> {
@@ -1801,7 +1912,10 @@ pub fn log_emit(level: String, message: String) -> String {
 pub fn runtime_stats() -> String {
     let mut http_pending = http_req_pool().lock().map(|m| m.len()).unwrap_or_default();
     let mut fs_pending = fs_req_pool().lock().map(|m| m.len()).unwrap_or_default();
+    #[cfg(feature = "wasi")]
     let mut wasi_pending = wasi_req_pool().lock().map(|m| m.len()).unwrap_or_default();
+    #[cfg(not(feature = "wasi"))]
+    let wasi_pending = 0usize;
 
     if let Ok(mut pool) = http_req_pool().lock() {
         cleanup_stale_pending(&mut pool, &HTTP_STALE_DROPS);
@@ -1811,18 +1925,50 @@ pub fn runtime_stats() -> String {
         cleanup_stale_pending(&mut pool, &FS_STALE_DROPS);
         fs_pending = pool.len();
     }
+    #[cfg(feature = "wasi")]
     if let Ok(mut pool) = wasi_req_pool().lock() {
         cleanup_stale_pending(&mut pool, &WASI_STALE_DROPS);
         wasi_pending = pool.len();
     }
 
+    #[cfg(feature = "wasi")]
     let wasi_cache_size = wasi_module_cache()
         .lock()
         .map(|m| m.len())
         .unwrap_or_default();
+    #[cfg(not(feature = "wasi"))]
+    let wasi_cache_size = 0usize;
     let http_available = http_io_sem().available_permits();
     let fs_available = fs_io_sem().available_permits();
+    #[cfg(feature = "wasi")]
     let wasi_available = wasi_io_sem().available_permits();
+    #[cfg(not(feature = "wasi"))]
+    let wasi_available = 0usize;
+
+    #[cfg(feature = "wasi")]
+    let wasi_stale_drops = WASI_STALE_DROPS.load(Ordering::Relaxed);
+    #[cfg(not(feature = "wasi"))]
+    let wasi_stale_drops = 0_u64;
+
+    #[cfg(feature = "wasi")]
+    let wasi_cache_capacity = WASI_MODULE_CACHE_MAX_ENTRIES;
+    #[cfg(not(feature = "wasi"))]
+    let wasi_cache_capacity = 0usize;
+
+    #[cfg(feature = "wasi")]
+    let wasi_cache_hits = WASI_CACHE_HITS.load(Ordering::Relaxed);
+    #[cfg(not(feature = "wasi"))]
+    let wasi_cache_hits = 0_u64;
+
+    #[cfg(feature = "wasi")]
+    let wasi_cache_misses = WASI_CACHE_MISSES.load(Ordering::Relaxed);
+    #[cfg(not(feature = "wasi"))]
+    let wasi_cache_misses = 0_u64;
+
+    #[cfg(feature = "wasi")]
+    let wasi_cache_evictions = WASI_CACHE_EVICTIONS.load(Ordering::Relaxed);
+    #[cfg(not(feature = "wasi"))]
+    let wasi_cache_evictions = 0_u64;
 
     json!({
         "ok": true,
@@ -1851,7 +1997,7 @@ pub fn runtime_stats() -> String {
         "staleDrops": {
             "http": HTTP_STALE_DROPS.load(Ordering::Relaxed),
             "fs": FS_STALE_DROPS.load(Ordering::Relaxed),
-            "wasi": WASI_STALE_DROPS.load(Ordering::Relaxed),
+            "wasi": wasi_stale_drops,
         },
         "logs": {
             "pending": LOG_PENDING.load(Ordering::Relaxed),
@@ -1864,10 +2010,10 @@ pub fn runtime_stats() -> String {
         },
         "wasi": {
             "cacheSize": wasi_cache_size,
-            "cacheCapacity": WASI_MODULE_CACHE_MAX_ENTRIES,
-            "cacheHits": WASI_CACHE_HITS.load(Ordering::Relaxed),
-            "cacheMisses": WASI_CACHE_MISSES.load(Ordering::Relaxed),
-            "cacheEvictions": WASI_CACHE_EVICTIONS.load(Ordering::Relaxed),
+            "cacheCapacity": wasi_cache_capacity,
+            "cacheHits": wasi_cache_hits,
+            "cacheMisses": wasi_cache_misses,
+            "cacheEvictions": wasi_cache_evictions,
         }
     })
     .to_string()
@@ -2230,6 +2376,7 @@ pub fn native_exec_chain(input_id: u64, steps_json: String) -> String {
     json!({ "ok": true, "id": output_id }).to_string()
 }
 
+#[cfg(feature = "wasi")]
 fn parse_argv(args_json: Option<String>) -> AnyResult<Vec<String>> {
     let Some(raw) = args_json else {
         return Ok(Vec::new());
@@ -2252,8 +2399,10 @@ fn parse_argv(args_json: Option<String>) -> AnyResult<Vec<String>> {
     Ok(out)
 }
 
+#[cfg(feature = "wasi")]
 const WASI_MODULE_CACHE_MAX_ENTRIES: usize = 64;
 
+#[cfg(feature = "wasi")]
 fn wasi_module_get_or_compile(wasm_bytes: &[u8]) -> AnyResult<Module> {
     {
         let cache = wasi_module_cache()
@@ -2298,6 +2447,7 @@ fn wasi_module_get_or_compile(wasm_bytes: &[u8]) -> AnyResult<Module> {
     Ok(module)
 }
 
+#[cfg(feature = "wasi")]
 fn wasi_run_inner(
     module_id: u64,
     stdin_id: Option<u64>,
@@ -2402,6 +2552,7 @@ fn wasi_run_inner(
     .to_string()
 }
 
+#[cfg(feature = "wasi")]
 pub fn wasi_run_start(
     module_id: u64,
     stdin_id: Option<u64>,
@@ -2458,6 +2609,7 @@ pub fn wasi_run_start(
     json!({ "ok": true, "id": id }).to_string()
 }
 
+#[cfg(feature = "wasi")]
 pub fn wasi_run_try_take(id: u64) -> String {
     let mut pool = wasi_req_pool().lock().expect("wasi 请求池加锁失败");
     cleanup_stale_pending(&mut pool, &WASI_STALE_DROPS);
@@ -2478,6 +2630,7 @@ pub fn wasi_run_try_take(id: u64) -> String {
     }
 }
 
+#[cfg(feature = "wasi")]
 pub fn wasi_run_drop(id: u64) -> String {
     let mut pool = wasi_req_pool().lock().expect("wasi 请求池加锁失败");
     let existed = if let Some(pending) = pool.remove(&id) {
@@ -2489,6 +2642,7 @@ pub fn wasi_run_drop(id: u64) -> String {
     json!({ "ok": true, "dropped": existed }).to_string()
 }
 
+#[cfg(feature = "wasi")]
 pub fn wasi_run_start_evented<F>(
     module_id: u64,
     stdin_id: Option<u64>,
@@ -2558,6 +2712,7 @@ where
     json!({ "ok": true, "id": id }).to_string()
 }
 
+#[cfg(feature = "wasi")]
 pub fn wasi_run_drop_evented(id: u64) -> String {
     let mut pool = wasi_req_event_pool()
         .lock()
@@ -2569,6 +2724,45 @@ pub fn wasi_run_drop_evented(id: u64) -> String {
         false
     };
     json!({ "ok": true, "dropped": existed }).to_string()
+}
+
+#[cfg(not(feature = "wasi"))]
+pub fn wasi_run_start(
+    _module_id: u64,
+    _stdin_id: Option<u64>,
+    _args_json: Option<String>,
+    _consume_module: bool,
+) -> String {
+    json!({ "ok": false, "error": "当前构建未启用 wasi Cargo 特性" }).to_string()
+}
+
+#[cfg(not(feature = "wasi"))]
+pub fn wasi_run_try_take(_id: u64) -> String {
+    json!({ "ok": false, "error": "当前构建未启用 wasi Cargo 特性" }).to_string()
+}
+
+#[cfg(not(feature = "wasi"))]
+pub fn wasi_run_drop(_id: u64) -> String {
+    json!({ "ok": true, "dropped": false }).to_string()
+}
+
+#[cfg(not(feature = "wasi"))]
+pub fn wasi_run_start_evented<F>(
+    _module_id: u64,
+    _stdin_id: Option<u64>,
+    _args_json: Option<String>,
+    _consume_module: bool,
+    _on_complete: F,
+) -> String
+where
+    F: FnOnce(u64, String) + Send + 'static,
+{
+    json!({ "ok": false, "error": "当前构建未启用 wasi Cargo 特性" }).to_string()
+}
+
+#[cfg(not(feature = "wasi"))]
+pub fn wasi_run_drop_evented(_id: u64) -> String {
+    json!({ "ok": true, "dropped": false }).to_string()
 }
 
 fn parse_host_ok_payload(raw: String) -> AnyResult<Value> {
@@ -3449,6 +3643,23 @@ pub fn fs_mkdtemp(prefix: String) -> String {
 #[cfg(test)]
 pub fn run_async_script(script: &str) -> Result<String, Box<dyn std::error::Error>> {
     let runtime = crate::host_runtime::AsyncHostRuntime::new("test-web-runtime")?;
+    let task = runtime.spawn(script)?;
+    task.wait().map_err(|e| e.into())
+}
+
+#[cfg(test)]
+pub fn run_async_script_without_wasi(script: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let runtime = crate::host_runtime::AsyncHostRuntime::new("test-web-runtime-no-wasi")?;
+    let task = runtime.spawn(script)?;
+    task.wait().map_err(|e| e.into())
+}
+
+#[cfg(test)]
+pub fn run_async_script_with_wasi(script: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let runtime = crate::host_runtime::AsyncHostRuntime::new_with_options(
+        "test-web-runtime-wasi",
+        WebRuntimeOptions { wasi: true },
+    )?;
     let task = runtime.spawn(script)?;
     task.wait().map_err(|e| e.into())
 }

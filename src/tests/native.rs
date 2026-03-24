@@ -1,7 +1,11 @@
 use crate::tests::run_async_script;
+#[cfg(feature = "wasi")]
+use crate::tests::run_async_script_with_wasi;
 use serde_json::Value;
+#[cfg(feature = "wasi")]
 use wat::parse_str;
 
+#[cfg(feature = "wasi")]
 fn wasi_echo_stdin_module_bytes() -> Vec<u8> {
     parse_str(
         r#"
@@ -53,6 +57,7 @@ fn wasi_echo_stdin_module_bytes() -> Vec<u8> {
     .expect("构建 wasi echo 模块失败")
 }
 
+#[cfg(feature = "wasi")]
 fn wasi_increment_stdin_module_bytes() -> Vec<u8> {
     parse_str(
         r#"
@@ -266,6 +271,7 @@ fn native_exec_with_extra_input() {
     assert_eq!(parsed["v2"], 2);
 }
 
+#[cfg(feature = "wasi")]
 #[test]
 fn wasi_run_minimal_module() {
     let script = r#"
@@ -288,13 +294,14 @@ fn wasi_run_minimal_module() {
       })()
     "#;
 
-    let result = run_async_script(script).expect("执行脚本失败");
+    let result = run_async_script_with_wasi(script).expect("执行脚本失败");
     let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
     assert_eq!(parsed["exitCode"], 0);
     assert_eq!(parsed["stdoutLen"], 0);
     assert_eq!(parsed["stderrLen"], 0);
 }
 
+#[cfg(feature = "wasi")]
 #[test]
 fn wasi_run_reuse_module_id() {
     let script = r#"
@@ -321,12 +328,13 @@ fn wasi_run_reuse_module_id() {
       })()
     "#;
 
-    let result = run_async_script(script).expect("执行脚本失败");
+    let result = run_async_script_with_wasi(script).expect("执行脚本失败");
     let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
     assert_eq!(parsed["c1"], 0);
     assert_eq!(parsed["c2"], 0);
 }
 
+#[cfg(feature = "wasi")]
 #[test]
 fn wasi_run_processes_stdin_to_stdout() {
     let wasm = wasi_echo_stdin_module_bytes();
@@ -352,13 +360,14 @@ fn wasi_run_processes_stdin_to_stdout() {
     "#
     );
 
-    let result = run_async_script(&script).expect("执行脚本失败");
+    let result = run_async_script_with_wasi(&script).expect("执行脚本失败");
     let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
     assert_eq!(parsed["exitCode"], 0);
     assert_eq!(parsed["text"], "hello-wasi-io");
     assert_eq!(parsed["stderrLen"], 0);
 }
 
+#[cfg(feature = "wasi")]
 #[test]
 fn wasi_run_transforms_stdin_bytes() {
     let wasm = wasi_increment_stdin_module_bytes();
@@ -380,7 +389,7 @@ fn wasi_run_transforms_stdin_bytes() {
     "#
     );
 
-    let result = run_async_script(&script).expect("执行脚本失败");
+    let result = run_async_script_with_wasi(&script).expect("执行脚本失败");
     let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
     assert_eq!(parsed["exitCode"], 0);
     assert_eq!(parsed["out"][0], 66);
@@ -476,6 +485,7 @@ fn native_exec_chain_with_extra_input() {
     assert_eq!(parsed["out"][2], 253);
 }
 
+#[cfg(feature = "wasi")]
 #[test]
 fn wasi_run_by_id_consumes_module_by_default() {
     let script = r#"
@@ -507,7 +517,7 @@ fn wasi_run_by_id_consumes_module_by_default() {
       })()
     "#;
 
-    let result = run_async_script(script).expect("执行脚本失败");
+    let result = run_async_script_with_wasi(script).expect("执行脚本失败");
     let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
     assert_eq!(parsed["firstExit"], 0);
     assert_eq!(parsed["secondErrorHasId"], true);

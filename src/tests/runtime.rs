@@ -1,11 +1,15 @@
-use crate::tests::run_async_script;
+#[cfg(feature = "wasi")]
+use crate::tests::run_async_script_with_wasi;
+use crate::tests::{run_async_script, run_async_script_without_wasi};
 use crate::web_runtime::{
     configure_log_http_endpoint, plugin_call, plugin_get_info, plugin_list, plugin_load_bundle,
     WEB_POLYFILL,
 };
 use rquickjs::{Context, Runtime};
 use serde_json::Value;
+#[cfg(feature = "wasi")]
 use std::fs;
+#[cfg(feature = "wasi")]
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
@@ -29,16 +33,13 @@ fn runtime_timers_and_microtask() {
           if (count >= 2) clearInterval(intervalId);
         }, 1);
 
-        await Promise.resolve();
-        await Promise.resolve();
-        await Promise.resolve();
-        await Promise.resolve();
+        await new Promise((resolve) => setTimeout(resolve, 20));
 
         return JSON.stringify({ events });
       })()
     "#;
 
-    let result = run_async_script(script).expect("执行脚本失败");
+    let result = run_async_script_without_wasi(script).expect("执行脚本失败");
     let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
     let events = parsed["events"].as_array().expect("events 必须是数组");
 
@@ -69,7 +70,7 @@ fn runtime_text_and_base64() {
       })()
     "#;
 
-    let result = run_async_script(script).expect("执行脚本失败");
+    let result = run_async_script_without_wasi(script).expect("执行脚本失败");
     let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
 
     assert_eq!(parsed["text"], "A中B");
@@ -128,9 +129,7 @@ fn runtime_process_and_immediate() {
         const dt = process.hrtime(t0);
         const ns = process.hrtime.bigint();
 
-        await Promise.resolve();
-        await Promise.resolve();
-        await Promise.resolve();
+        await new Promise((resolve) => setTimeout(resolve, 10));
 
         return JSON.stringify({
           hasProcess: typeof process === "object",
@@ -422,6 +421,19 @@ fn runtime_stats_exposed() {
 }
 
 #[test]
+fn wasi_is_not_injected_by_default() {
+    let script = r#"
+      (async () => JSON.stringify({
+        hasWasi: typeof globalThis.wasi !== "undefined"
+      }))()
+    "#;
+
+    let result = run_async_script_without_wasi(script).expect("执行脚本失败");
+    let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
+    assert_eq!(parsed["hasWasi"], false);
+}
+
+#[test]
 fn runtime_console_hook_emits_to_host_logger() {
     let script = r#"
       (async () => {
@@ -542,6 +554,7 @@ fn runtime_console_all_levels_forwarded_to_http_endpoint() {
     assert!(third["payload"]["tsMs"].is_number());
 }
 
+#[cfg(feature = "wasi")]
 #[test]
 fn runtime_runs_compiled_pnpm_bundle() {
     let mut bundle_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -577,7 +590,7 @@ fn runtime_runs_compiled_pnpm_bundle() {
     "#
     );
 
-    let result = run_async_script(&script).expect("执行脚本失败");
+    let result = run_async_script_with_wasi(&script).expect("执行脚本失败");
     let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
 
     assert_eq!(parsed["ok"], true);

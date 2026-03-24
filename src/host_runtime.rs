@@ -11,8 +11,9 @@ use std::thread;
 use tokio::sync::oneshot;
 
 use crate::web_runtime::{
-    WEB_POLYFILL, http_request_drop_evented, http_request_start_evented, install_host_bindings,
-    timer_drop_evented, timer_start_evented, wasi_run_drop_evented, wasi_run_start_evented,
+    WebRuntimeOptions, http_request_drop_evented, http_request_start_evented,
+    install_host_bindings, polyfill_script, timer_drop_evented, timer_start_evented,
+    wasi_run_drop_evented, wasi_run_start_evented,
 };
 
 #[cfg(feature = "host-fs")]
@@ -192,6 +193,7 @@ pub struct HostRuntime {
     runtime: Runtime,
     context: Context,
     cache_scope_id: String,
+    options: WebRuntimeOptions,
 }
 
 #[derive(Debug, Clone)]
@@ -205,6 +207,7 @@ pub struct RuntimeTaskStats {
 pub struct AsyncHostRuntime {
     runtime_id: u64,
     cache_scope_id: String,
+    options: WebRuntimeOptions,
     tx: mpsc::Sender<WorkerSignal>,
     states: Arc<Mutex<HashMap<u64, TaskState>>>,
     waiters: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<String, String>>>>>,
@@ -284,12 +287,27 @@ struct RuntimeShared {
 
 impl HostRuntime {
     pub fn new(cache_scope_id: String) -> Result<Self, rquickjs::Error> {
+        Self::new_with_options(cache_scope_id, WebRuntimeOptions::default())
+    }
+
+    pub fn new_with_options(
+        cache_scope_id: String,
+        options: WebRuntimeOptions,
+    ) -> Result<Self, rquickjs::Error> {
+        if options.wasi && !cfg!(feature = "wasi") {
+            return Err(rquickjs::Error::new_from_js_message(
+                "rust",
+                "runtime",
+                "当前构建未启用 wasi Cargo 特性",
+            ));
+        }
         let runtime = Runtime::new()?;
         let context = Context::full(&runtime)?;
+        let polyfill = polyfill_script(options);
 
         context.with(|ctx| {
-            install_host_bindings(&ctx, &cache_scope_id)?;
-            ctx.eval::<(), _>(WEB_POLYFILL)?;
+            install_host_bindings(&ctx, &cache_scope_id, options)?;
+            ctx.eval::<(), _>(polyfill.as_str())?;
             Ok::<(), rquickjs::Error>(())
         })?;
 
@@ -297,6 +315,7 @@ impl HostRuntime {
             runtime,
             context,
             cache_scope_id,
+            options,
         })
     }
 
@@ -337,12 +356,27 @@ impl HostRuntime {
     pub fn cache_scope_id(&self) -> &str {
         &self.cache_scope_id
     }
+
+    pub fn options(&self) -> WebRuntimeOptions {
+        self.options
+    }
 }
 
 impl AsyncHostRuntime {
     pub fn new(cache_scope_id: impl Into<String>) -> Result<Self, String> {
+        Self::new_with_options(cache_scope_id, WebRuntimeOptions::default())
+    }
+
+    pub fn new_with_options(
+        cache_scope_id: impl Into<String>,
+        options: WebRuntimeOptions,
+    ) -> Result<Self, String> {
+        if options.wasi && !cfg!(feature = "wasi") {
+            return Err("当前构建未启用 wasi Cargo 特性".to_string());
+        }
         let cache_scope_id = cache_scope_id.into();
         let cache_scope_id_for_worker = cache_scope_id.clone();
+        let options_for_worker = options;
         let (tx, rx) = mpsc::channel::<WorkerSignal>();
         let tx_for_worker = tx.clone();
         let states = Arc::new(Mutex::new(HashMap::<u64, TaskState>::new()));
@@ -363,7 +397,8 @@ impl AsyncHostRuntime {
         let (init_tx, init_rx) = mpsc::channel::<Result<(), String>>();
 
         thread::spawn(move || {
-            let host = match HostRuntime::new(cache_scope_id_for_worker) {
+            let host = match HostRuntime::new_with_options(cache_scope_id_for_worker, options_for_worker)
+            {
                 Ok(host) => host,
                 Err(err) => {
                     let _ = init_tx.send(Err(format!("初始化 HostRuntime 失败: {err}")));
@@ -438,6 +473,7 @@ impl AsyncHostRuntime {
             Ok(Ok(())) => Ok(Self {
                 runtime_id,
                 cache_scope_id,
+                options,
                 tx,
                 states,
                 waiters,
@@ -561,6 +597,10 @@ impl AsyncHostRuntime {
 
     pub fn cache_scope_id(&self) -> &str {
         &self.cache_scope_id
+    }
+
+    pub fn options(&self) -> WebRuntimeOptions {
+        self.options
     }
 
     pub async fn bundle_load(&self, name: &str, source: &str) -> Result<(), String> {
@@ -1036,7 +1076,7 @@ fn install_async_runtime_bindings(
             "__host_runtime_task_complete",
             Func::from(async_runtime_task_complete),
         )?;
-        install_evented_host_bindings_worker(&ctx, signal_tx.clone())?;
+        install_evented_host_bindings_worker(&ctx, signal_tx.clone(), host.options())?;
         ctx.eval::<(), _>(ASYNC_TASK_DISPATCHER_JS)?;
         Ok::<(), rquickjs::Error>(())
     })
@@ -1046,6 +1086,7 @@ fn install_async_runtime_bindings(
 fn install_evented_host_bindings_worker(
     ctx: &rquickjs::Ctx<'_>,
     signal_tx: mpsc::Sender<WorkerSignal>,
+    options: WebRuntimeOptions,
 ) -> Result<(), rquickjs::Error> {
     let globals = ctx.globals();
 
@@ -1103,32 +1144,34 @@ fn install_evented_host_bindings_worker(
         globals.set("__fs_task_drop_evented", Func::from(fs_task_drop_evented))?;
     }
 
-    let wasi_tx = signal_tx;
-    globals.set(
-        "__wasi_run_start_evented",
-        Function::new(
-            ctx.clone(),
-            move |module_id: u64,
-                  stdin_id: Option<u64>,
-                  args_json: Option<String>,
-                  consume_module: bool| {
-                let tx = wasi_tx.clone();
-                wasi_run_start_evented(
-                    module_id,
-                    stdin_id,
-                    args_json,
-                    consume_module,
-                    move |id, payload| {
-                        let _ = tx.send(WorkerSignal::HostEvent(HostEvent::WasiCompleted {
-                            id,
-                            payload,
-                        }));
-                    },
-                )
-            },
-        )?,
-    )?;
-    globals.set("__wasi_run_drop_evented", Func::from(wasi_run_drop_evented))?;
+    if options.wasi {
+        let wasi_tx = signal_tx;
+        globals.set(
+            "__wasi_run_start_evented",
+            Function::new(
+                ctx.clone(),
+                move |module_id: u64,
+                      stdin_id: Option<u64>,
+                      args_json: Option<String>,
+                      consume_module: bool| {
+                    let tx = wasi_tx.clone();
+                    wasi_run_start_evented(
+                        module_id,
+                        stdin_id,
+                        args_json,
+                        consume_module,
+                        move |id, payload| {
+                            let _ = tx.send(WorkerSignal::HostEvent(HostEvent::WasiCompleted {
+                                id,
+                                payload,
+                            }));
+                        },
+                    )
+                },
+            )?,
+        )?;
+        globals.set("__wasi_run_drop_evented", Func::from(wasi_run_drop_evented))?;
+    }
 
     Ok(())
 }

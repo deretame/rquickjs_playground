@@ -5,7 +5,9 @@ pub mod native;
 pub mod runtime;
 pub mod task_runtime;
 
-pub use crate::web_runtime::run_async_script;
+pub use crate::web_runtime::{
+    run_async_script, run_async_script_with_wasi, run_async_script_without_wasi,
+};
 use serde_json::{json, Map, Value};
 use std::path::PathBuf;
 use std::process::Command;
