@@ -1,9 +1,17 @@
 use crate::tests::run_async_script;
 #[cfg(feature = "wasi")]
 use crate::tests::run_async_script_with_wasi;
-use serde_json::Value;
+use crate::{
+    register_bridge_route_async_handler, register_bridge_route_handler,
+    unregister_bridge_route_handler,
+};
+use serde_json::{Value, json};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 #[cfg(feature = "wasi")]
 use wat::parse_str;
+
+static BRIDGE_ROUTE_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(feature = "wasi")]
 fn wasi_echo_stdin_module_bytes() -> Vec<u8> {
@@ -579,6 +587,85 @@ fn bridge_call_by_function_name_with_args() {
     assert_eq!(parsed["out"][1], 253);
     assert_eq!(parsed["out"][2], 252);
     assert_eq!(parsed["sum"], 3.5);
+}
+
+#[test]
+fn bridge_call_with_external_route_handler() {
+    let route = format!(
+        "test.custom.bridge.{}",
+        BRIDGE_ROUTE_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+
+    register_bridge_route_handler(route.clone(), |runtime_name, args| {
+        let first = args.first().cloned().unwrap_or(Value::Null);
+        Ok(json!({
+            "runtime": runtime_name,
+            "first": first,
+            "argc": args.len()
+        }))
+    })
+    .expect("注册 bridge 自定义路由失败");
+
+    let route_json = serde_json::to_string(&route).expect("序列化路由名失败");
+    let script = format!(
+        r#"
+      (async () => {{
+        const out = await bridge.call({route_json}, 42, "x");
+        return JSON.stringify(out);
+      }})()
+    "#
+    );
+
+    let result = run_async_script(&script).expect("执行脚本失败");
+    let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
+
+    assert_eq!(parsed["first"], 42);
+    assert_eq!(parsed["argc"], 2);
+    assert!(parsed["runtime"].as_str().is_some());
+
+    let removed = unregister_bridge_route_handler(&route).expect("卸载 bridge 自定义路由失败");
+    assert!(removed);
+}
+
+#[test]
+fn bridge_call_with_external_async_route_handler() {
+    let route = format!(
+        "test.custom.bridge.async.{}",
+        BRIDGE_ROUTE_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+
+    register_bridge_route_async_handler(route.clone(), |runtime_name, args| async move {
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        let first = args.first().cloned().unwrap_or(Value::Null);
+        Ok(json!({
+            "runtime": runtime_name,
+            "first": first,
+            "argc": args.len(),
+            "async": true
+        }))
+    })
+    .expect("注册 bridge 异步自定义路由失败");
+
+    let route_json = serde_json::to_string(&route).expect("序列化路由名失败");
+    let script = format!(
+        r#"
+      (async () => {{
+        const out = await bridge.call({route_json}, "hello", 7);
+        return JSON.stringify(out);
+      }})()
+    "#
+    );
+
+    let result = run_async_script(&script).expect("执行脚本失败");
+    let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
+
+    assert_eq!(parsed["first"], "hello");
+    assert_eq!(parsed["argc"], 2);
+    assert_eq!(parsed["async"], true);
+    assert!(parsed["runtime"].as_str().is_some());
+
+    let removed = unregister_bridge_route_handler(&route).expect("卸载 bridge 自定义路由失败");
+    assert!(removed);
 }
 
 #[test]

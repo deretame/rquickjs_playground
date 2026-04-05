@@ -12,10 +12,12 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 #[cfg(feature = "wasi")]
 use std::collections::VecDeque;
+use std::future::Future;
 use std::fs;
 use std::io;
 use std::io::Read;
 use std::io::Write;
+use std::pin::Pin;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
@@ -190,6 +192,18 @@ pub fn install_host_bindings(
             },
         )?,
     )?;
+    let cache_scope_for_host_call_start = cache_scope_id.clone();
+    globals.set(
+        "__host_call_start",
+        Function::new(
+            ctx.clone(),
+            move |name: String, args_json: Option<String>| {
+                host_call_start(cache_scope_for_host_call_start.clone(), name, args_json)
+            },
+        )?,
+    )?;
+    globals.set("__host_call_try_take", Func::from(host_call_try_take))?;
+    globals.set("__host_call_drop", Func::from(host_call_drop))?;
     if options.wasi {
         globals.set("__wasi_run_start", Func::from(wasi_run_start))?;
         globals.set("__wasi_run_try_take", Func::from(wasi_run_try_take))?;
@@ -275,6 +289,8 @@ pub fn install_host_bindings(
 
 static HTTP_REQ_ID: AtomicU64 = AtomicU64::new(1);
 static HTTP_REQ_POOL: OnceLock<Mutex<HashMap<u64, PendingTask>>> = OnceLock::new();
+static BRIDGE_REQ_ID: AtomicU64 = AtomicU64::new(1);
+static BRIDGE_REQ_POOL: OnceLock<Mutex<HashMap<u64, PendingTask>>> = OnceLock::new();
 static HTTP_REQ_EVENT_POOL: OnceLock<Mutex<HashMap<u64, PendingAbortTask>>> = OnceLock::new();
 static FS_REQ_ID: AtomicU64 = AtomicU64::new(1);
 static FS_REQ_POOL: OnceLock<Mutex<HashMap<u64, PendingTask>>> = OnceLock::new();
@@ -309,6 +325,7 @@ static FS_IO_SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
 #[cfg(feature = "wasi")]
 static WASI_IO_SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static HTTP_STALE_DROPS: AtomicU64 = AtomicU64::new(0);
+static BRIDGE_STALE_DROPS: AtomicU64 = AtomicU64::new(0);
 static FS_STALE_DROPS: AtomicU64 = AtomicU64::new(0);
 static TIMER_STALE_DROPS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "wasi")]
@@ -324,8 +341,21 @@ static LOG_ERRORS: AtomicU64 = AtomicU64::new(0);
 static LOG_PENDING: AtomicU64 = AtomicU64::new(0);
 type PluginConfigHandler =
     Arc<dyn Fn(String, String, String) -> AnyResult<String> + Send + Sync + 'static>;
+type PluginConfigFuture = Pin<Box<dyn Future<Output = AnyResult<String>> + Send + 'static>>;
+type PluginConfigAsyncHandler =
+    Arc<dyn Fn(String, String, String) -> PluginConfigFuture + Send + Sync + 'static>;
+type BridgeRouteHandler = Arc<dyn Fn(String, Vec<Value>) -> AnyResult<Value> + Send + Sync + 'static>;
+type BridgeRouteFuture = Pin<Box<dyn Future<Output = AnyResult<Value>> + Send + 'static>>;
+type BridgeRouteAsyncHandler = Arc<dyn Fn(String, Vec<Value>) -> BridgeRouteFuture + Send + Sync + 'static>;
 static SAVE_PLUGIN_CONFIG_HANDLER: OnceLock<Mutex<Option<PluginConfigHandler>>> = OnceLock::new();
 static LOAD_PLUGIN_CONFIG_HANDLER: OnceLock<Mutex<Option<PluginConfigHandler>>> = OnceLock::new();
+static SAVE_PLUGIN_CONFIG_ASYNC_HANDLER: OnceLock<Mutex<Option<PluginConfigAsyncHandler>>> =
+    OnceLock::new();
+static LOAD_PLUGIN_CONFIG_ASYNC_HANDLER: OnceLock<Mutex<Option<PluginConfigAsyncHandler>>> =
+    OnceLock::new();
+static BRIDGE_ROUTE_HANDLERS: OnceLock<Mutex<HashMap<String, BridgeRouteHandler>>> = OnceLock::new();
+static BRIDGE_ROUTE_ASYNC_HANDLERS: OnceLock<Mutex<HashMap<String, BridgeRouteAsyncHandler>>> =
+    OnceLock::new();
 
 struct PendingTask {
     rx: mpsc::Receiver<String>,
@@ -396,12 +426,32 @@ fn http_req_pool() -> &'static Mutex<HashMap<u64, PendingTask>> {
     HTTP_REQ_POOL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn bridge_req_pool() -> &'static Mutex<HashMap<u64, PendingTask>> {
+    BRIDGE_REQ_POOL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn save_plugin_config_handler_cell() -> &'static Mutex<Option<PluginConfigHandler>> {
     SAVE_PLUGIN_CONFIG_HANDLER.get_or_init(|| Mutex::new(None))
 }
 
 fn load_plugin_config_handler_cell() -> &'static Mutex<Option<PluginConfigHandler>> {
     LOAD_PLUGIN_CONFIG_HANDLER.get_or_init(|| Mutex::new(None))
+}
+
+fn save_plugin_config_async_handler_cell() -> &'static Mutex<Option<PluginConfigAsyncHandler>> {
+    SAVE_PLUGIN_CONFIG_ASYNC_HANDLER.get_or_init(|| Mutex::new(None))
+}
+
+fn load_plugin_config_async_handler_cell() -> &'static Mutex<Option<PluginConfigAsyncHandler>> {
+    LOAD_PLUGIN_CONFIG_ASYNC_HANDLER.get_or_init(|| Mutex::new(None))
+}
+
+fn bridge_route_handler_cell() -> &'static Mutex<HashMap<String, BridgeRouteHandler>> {
+    BRIDGE_ROUTE_HANDLERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn bridge_route_async_handler_cell() -> &'static Mutex<HashMap<String, BridgeRouteAsyncHandler>> {
+    BRIDGE_ROUTE_ASYNC_HANDLERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 pub fn register_save_plugin_config_handler<F>(handler: F)
@@ -420,6 +470,116 @@ where
     if let Ok(mut guard) = load_plugin_config_handler_cell().lock() {
         *guard = Some(Arc::new(handler));
     }
+}
+
+pub fn register_save_plugin_config_async_handler<F, Fut>(handler: F)
+where
+    F: Fn(String, String, String) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = AnyResult<String>> + Send + 'static,
+{
+    let wrapped = Arc::new(move |runtime_name: String, key: String, value: String| {
+        Box::pin(handler(runtime_name, key, value)) as PluginConfigFuture
+    }) as PluginConfigAsyncHandler;
+    if let Ok(mut guard) = save_plugin_config_async_handler_cell().lock() {
+        *guard = Some(wrapped);
+    }
+}
+
+pub fn register_load_plugin_config_async_handler<F, Fut>(handler: F)
+where
+    F: Fn(String, String, String) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = AnyResult<String>> + Send + 'static,
+{
+    let wrapped = Arc::new(move |runtime_name: String, key: String, value: String| {
+        Box::pin(handler(runtime_name, key, value)) as PluginConfigFuture
+    }) as PluginConfigAsyncHandler;
+    if let Ok(mut guard) = load_plugin_config_async_handler_cell().lock() {
+        *guard = Some(wrapped);
+    }
+}
+
+pub fn register_bridge_route_handler<F>(name: impl Into<String>, handler: F) -> AnyResult<()>
+where
+    F: Fn(String, Vec<Value>) -> AnyResult<Value> + Send + Sync + 'static,
+{
+    let name = name.into().trim().to_string();
+    if name.is_empty() {
+        return Err(anyhow!("bridge 路由名不能为空"));
+    }
+    let mut handlers = bridge_route_handler_cell()
+        .lock()
+        .map_err(|_| anyhow!("bridge 路由表锁已损坏"))?;
+    handlers.insert(name, Arc::new(handler));
+    Ok(())
+}
+
+pub fn register_bridge_route_async_handler<F, Fut>(
+    name: impl Into<String>,
+    handler: F,
+) -> AnyResult<()>
+where
+    F: Fn(String, Vec<Value>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = AnyResult<Value>> + Send + 'static,
+{
+    let name = name.into().trim().to_string();
+    if name.is_empty() {
+        return Err(anyhow!("bridge 路由名不能为空"));
+    }
+    let wrapped = Arc::new(move |runtime_name: String, args: Vec<Value>| {
+        Box::pin(handler(runtime_name, args)) as BridgeRouteFuture
+    }) as BridgeRouteAsyncHandler;
+    let mut handlers = bridge_route_async_handler_cell()
+        .lock()
+        .map_err(|_| anyhow!("bridge 异步路由表锁已损坏"))?;
+    handlers.insert(name, wrapped);
+    Ok(())
+}
+
+pub fn unregister_bridge_route_handler(name: &str) -> AnyResult<bool> {
+    let mut handlers = bridge_route_handler_cell()
+        .lock()
+        .map_err(|_| anyhow!("bridge 路由表锁已损坏"))?;
+    let removed_sync = handlers.remove(name).is_some();
+    drop(handlers);
+
+    let mut async_handlers = bridge_route_async_handler_cell()
+        .lock()
+        .map_err(|_| anyhow!("bridge 异步路由表锁已损坏"))?;
+    let removed_async = async_handlers.remove(name).is_some();
+    Ok(removed_sync || removed_async)
+}
+
+fn call_registered_bridge_route(runtime_name: String, name: String, args: Vec<Value>) -> AnyResult<Value> {
+    let handler = bridge_route_handler_cell()
+        .lock()
+        .map_err(|_| anyhow!("bridge 路由表锁已损坏"))?
+        .get(&name)
+        .cloned()
+        .ok_or_else(|| anyhow!("不支持的 bridge 方法: {name}"))?;
+    handler(runtime_name, args)
+}
+
+async fn call_registered_bridge_route_async(
+    runtime_name: String,
+    name: String,
+    args: Vec<Value>,
+) -> AnyResult<Value> {
+    if let Some(sync_handler) = bridge_route_handler_cell()
+        .lock()
+        .map_err(|_| anyhow!("bridge 路由表锁已损坏"))?
+        .get(&name)
+        .cloned()
+    {
+        return sync_handler(runtime_name, args);
+    }
+
+    let async_handler = bridge_route_async_handler_cell()
+        .lock()
+        .map_err(|_| anyhow!("bridge 异步路由表锁已损坏"))?
+        .get(&name)
+        .cloned()
+        .ok_or_else(|| anyhow!("不支持的 bridge 方法: {name}"))?;
+    async_handler(runtime_name, args).await
 }
 
 fn call_registered_save_plugin_config(
@@ -446,6 +606,40 @@ fn call_registered_load_plugin_config(
         .clone()
         .ok_or_else(|| anyhow!("load_plugin_config 回调未注册"))?;
     handler(runtime_name, key, value)
+}
+
+async fn call_registered_save_plugin_config_async(
+    runtime_name: String,
+    key: String,
+    value: String,
+) -> AnyResult<String> {
+    let handler = {
+        save_plugin_config_async_handler_cell()
+            .lock()
+            .map_err(|_| anyhow!("save_plugin_config 异步回调锁已损坏"))?
+            .clone()
+    };
+    if let Some(handler) = handler {
+        return handler(runtime_name, key, value).await;
+    }
+    call_registered_save_plugin_config(runtime_name, key, value)
+}
+
+async fn call_registered_load_plugin_config_async(
+    runtime_name: String,
+    key: String,
+    value: String,
+) -> AnyResult<String> {
+    let handler = {
+        load_plugin_config_async_handler_cell()
+            .lock()
+            .map_err(|_| anyhow!("load_plugin_config 异步回调锁已损坏"))?
+            .clone()
+    };
+    if let Some(handler) = handler {
+        return handler(runtime_name, key, value).await;
+    }
+    call_registered_load_plugin_config(runtime_name, key, value)
 }
 
 fn http_req_event_pool() -> &'static Mutex<HashMap<u64, PendingAbortTask>> {
@@ -515,6 +709,7 @@ const HTTP_WASI_TRANSFORM_HEADER: &str = "x-rquickjs-host-wasi-transform-b64-v1"
 const HTTP_FORMDATA_BODY_HEADER: &str = "x-rquickjs-host-body-formdata-v1";
 const HTTP_AUTO_OFFLOAD_SIZE_THRESHOLD: u64 = 1 * 1024 * 1024;
 const HTTP_MAX_PENDING: usize = 4096;
+const BRIDGE_MAX_PENDING: usize = 4096;
 const FS_MAX_PENDING: usize = 4096;
 const TIMER_MAX_PENDING: usize = 8192;
 const WASI_MAX_PENDING: usize = 1024;
@@ -893,10 +1088,7 @@ async fn run_wasi_transform_once(plan: &WasiTransformPlan, input: Vec<u8>) -> An
 }
 
 #[cfg(not(feature = "wasi"))]
-async fn run_wasi_transform_once(
-    _plan: &WasiTransformPlan,
-    _input: Vec<u8>,
-) -> AnyResult<Vec<u8>> {
+async fn run_wasi_transform_once(_plan: &WasiTransformPlan, _input: Vec<u8>) -> AnyResult<Vec<u8>> {
     Err(anyhow!("当前构建未启用 wasi Cargo 特性"))
 }
 
@@ -3168,7 +3360,84 @@ fn bridge_call_inner(
             let out = call_registered_load_plugin_config(runtime_name, key, value)?;
             Ok(json!(out))
         }
-        _ => Err(anyhow!("不支持的 bridge 方法: {name}")),
+        _ => call_registered_bridge_route(runtime_name, name, args),
+    }
+}
+
+async fn bridge_call_inner_async(
+    runtime_name: String,
+    name: String,
+    args_json: Option<String>,
+) -> AnyResult<Value> {
+    let args = parse_bridge_args(args_json)?;
+
+    match name.as_str() {
+        "math.add" => {
+            let a = require_arg(&args, 0, "a")?
+                .as_f64()
+                .ok_or_else(|| anyhow!("参数 a 必须是数字"))?;
+            let b = require_arg(&args, 1, "b")?
+                .as_f64()
+                .ok_or_else(|| anyhow!("参数 b 必须是数字"))?;
+            Ok(json!(a + b))
+        }
+        "native.put" => {
+            let bytes = parse_u8_json_value(require_arg(&args, 0, "bytes")?)?;
+            let id = native_buffer_put_raw(bytes);
+            Ok(json!(id))
+        }
+        "native.take" => {
+            let id = require_u64_arg(&args, 0, "id")?;
+            match native_buffer_take_raw(id) {
+                Some(bytes) => Ok(json!(bytes)),
+                None => Err(anyhow!("buffer id 不存在")),
+            }
+        }
+        "native.exec" => {
+            let op = require_str_arg(&args, 0, "op")?;
+            let input_id = require_u64_arg(&args, 1, "inputId")?;
+            let args_json = args.get(2).and_then(|v| {
+                if v.is_null() {
+                    None
+                } else {
+                    Some(v.to_string())
+                }
+            });
+            let extra_input_id = args.get(3).and_then(Value::as_u64);
+            let payload =
+                parse_host_ok_payload(native_exec(op, input_id, args_json, extra_input_id))?;
+            Ok(payload.get("id").cloned().unwrap_or(Value::Null))
+        }
+        "crypto.md5_hex" => {
+            let input = require_str_arg(&args, 0, "input")?;
+            crypto_md5_hex(input)
+        }
+        "crypto.aes_ecb_pkcs7_decrypt_b64" => {
+            let payload_b64 = require_str_arg(&args, 0, "payloadB64")?;
+            let key_raw = require_str_arg(&args, 1, "keyRaw")?;
+            crypto_aes_ecb_pkcs7_decrypt_b64(payload_b64, key_raw)
+        }
+        "compression.gzip_decompress" => {
+            let input = parse_u8_json_value(require_arg(&args, 0, "input")?)?;
+            compression_gzip_decompress(input)
+        }
+        "compression.gzip_compress" => {
+            let input = parse_u8_json_value(require_arg(&args, 0, "input")?)?;
+            compression_gzip_compress(input)
+        }
+        "save_plugin_config" | "plugin_config.save_plugin_config" => {
+            let key = require_str_arg(&args, 0, "key")?;
+            let value = require_str_arg(&args, 1, "value")?;
+            let out = call_registered_save_plugin_config_async(runtime_name, key, value).await?;
+            Ok(json!(out))
+        }
+        "load_plugin_config" | "plugin_config.load_plugin_config" => {
+            let key = require_str_arg(&args, 0, "key")?;
+            let value = require_str_arg(&args, 1, "value")?;
+            let out = call_registered_load_plugin_config_async(runtime_name, key, value).await?;
+            Ok(json!(out))
+        }
+        _ => call_registered_bridge_route_async(runtime_name, name, args).await,
     }
 }
 
@@ -3177,6 +3446,71 @@ pub fn host_call(runtime_name: String, name: String, args_json: Option<String>) 
         Ok(data) => json!({ "ok": true, "data": data }).to_string(),
         Err(error) => json!({ "ok": false, "error": format!("{error:#}") }).to_string(),
     }
+}
+
+pub fn host_call_start(runtime_name: String, name: String, args_json: Option<String>) -> String {
+    {
+        let mut pool = bridge_req_pool().lock().expect("bridge 请求池加锁失败");
+        cleanup_stale_pending(&mut pool, &BRIDGE_STALE_DROPS);
+        if pool.len() >= BRIDGE_MAX_PENDING {
+            return json!({ "ok": false, "error": "bridge pending 队列已满" }).to_string();
+        }
+    }
+
+    let id = BRIDGE_REQ_ID.fetch_add(1, Ordering::Relaxed);
+    let (tx, rx) = mpsc::channel::<String>();
+    let task = host_async_runtime().spawn(async move {
+        let payload = match bridge_call_inner_async(runtime_name, name, args_json).await {
+            Ok(data) => json!({ "ok": true, "data": data }).to_string(),
+            Err(error) => json!({ "ok": false, "error": format!("{error:#}") }).to_string(),
+        };
+        let _ = tx.send(payload);
+    });
+
+    {
+        let mut pool = bridge_req_pool().lock().expect("bridge 请求池加锁失败");
+        pool.insert(
+            id,
+            PendingTask {
+                rx,
+                task,
+                created_at: Instant::now(),
+            },
+        );
+    }
+
+    json!({ "ok": true, "data": { "id": id } }).to_string()
+}
+
+pub fn host_call_try_take(id: u64) -> String {
+    let mut pool = bridge_req_pool().lock().expect("bridge 请求池加锁失败");
+    cleanup_stale_pending(&mut pool, &BRIDGE_STALE_DROPS);
+    let Some(pending) = pool.get_mut(&id) else {
+        return json!({ "ok": false, "error": "request id 不存在" }).to_string();
+    };
+
+    match pending.rx.try_recv() {
+        Ok(result) => {
+            pool.remove(&id);
+            json!({ "ok": true, "done": true, "result": result }).to_string()
+        }
+        Err(TryRecvError::Empty) => json!({ "ok": true, "done": false }).to_string(),
+        Err(TryRecvError::Disconnected) => {
+            pool.remove(&id);
+            json!({ "ok": false, "error": "request 执行线程异常退出" }).to_string()
+        }
+    }
+}
+
+pub fn host_call_drop(id: u64) -> String {
+    let mut pool = bridge_req_pool().lock().expect("bridge 请求池加锁失败");
+    let existed = if let Some(pending) = pool.remove(&id) {
+        pending.task.abort();
+        true
+    } else {
+        false
+    };
+    json!({ "ok": true, "dropped": existed }).to_string()
 }
 
 fn io_error_code(error: &io::Error) -> &'static str {

@@ -39,6 +39,40 @@
 
   async function call(name, ...args) {
     const normalizedArgs = args.map((arg) => normalizeArg(arg));
+    if (
+      typeof globalThis.__host_call_start === "function"
+      && typeof globalThis.__host_call_try_take === "function"
+    ) {
+      const started = parseHost(
+        globalThis.__host_call_start(String(name), JSON.stringify(normalizedArgs)),
+      );
+      const id = Number(started && started.id);
+      if (!Number.isFinite(id) || id <= 0) {
+        throw new Error("bridge 任务启动失败: 无效 id");
+      }
+
+      try {
+        while (true) {
+          const tickRaw = globalThis.__host_call_try_take(id);
+          const tick = JSON.parse(tickRaw);
+          if (!tick.ok) {
+            throw new Error(tick.error || "bridge 调用失败");
+          }
+          if (tick.done) {
+            return parseHost(tick.result);
+          }
+          await new Promise((resolve) => setTimeout(resolve, 0));
+        }
+      } finally {
+        if (typeof globalThis.__host_call_drop === "function") {
+          try {
+            globalThis.__host_call_drop(id);
+          } catch (_) {
+          }
+        }
+      }
+    }
+
     const raw = globalThis.__host_call(String(name), JSON.stringify(normalizedArgs));
     return parseHost(raw);
   }
