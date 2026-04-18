@@ -58,10 +58,6 @@ const WEB_POLYFILL_CORE: &str = concat!(
     "\n",
     include_str!("../js/62_bridge.js"),
     "\n",
-    include_str!("../js/63_plugin.js"),
-    "\n",
-    include_str!("../js/64_cache.js"),
-    "\n",
     include_str!("../js/65_console.js"),
     "\n"
 );
@@ -79,10 +75,6 @@ const WEB_POLYFILL_CORE: &str = concat!(
     include_str!("../js/60_native.js"),
     "\n",
     include_str!("../js/62_bridge.js"),
-    "\n",
-    include_str!("../js/63_plugin.js"),
-    "\n",
-    include_str!("../js/64_cache.js"),
     "\n",
     include_str!("../js/65_console.js"),
     "\n"
@@ -104,10 +96,6 @@ pub const WEB_POLYFILL: &str = concat!(
     "\n",
     include_str!("../js/62_bridge.js"),
     "\n",
-    include_str!("../js/63_plugin.js"),
-    "\n",
-    include_str!("../js/64_cache.js"),
-    "\n",
     include_str!("../js/65_console.js"),
     "\n",
     include_str!("../js/99_exports.js"),
@@ -127,10 +115,6 @@ pub const WEB_POLYFILL: &str = concat!(
     include_str!("../js/60_native.js"),
     "\n",
     include_str!("../js/62_bridge.js"),
-    "\n",
-    include_str!("../js/63_plugin.js"),
-    "\n",
-    include_str!("../js/64_cache.js"),
     "\n",
     include_str!("../js/65_console.js"),
     "\n",
@@ -157,7 +141,7 @@ pub fn polyfill_script(options: WebRuntimeOptions) -> String {
 
 pub fn install_host_bindings(
     ctx: &Ctx<'_>,
-    cache_scope_id: &str,
+    runtime_name: &str,
     options: WebRuntimeOptions,
 ) -> Result<(), rquickjs::Error> {
     if options.wasi && !cfg!(feature = "wasi") {
@@ -167,7 +151,7 @@ pub fn install_host_bindings(
             "当前构建未启用 wasi Cargo 特性",
         ));
     }
-    let cache_scope_id = normalize_runtime_cache_scope_id(cache_scope_id);
+    let runtime_name = normalize_runtime_name(runtime_name);
     let globals = ctx.globals();
     globals.set("__http_request_start", Func::from(http_request_start))?;
     globals.set("__http_request_try_take", Func::from(http_request_try_take))?;
@@ -182,23 +166,23 @@ pub fn install_host_bindings(
     globals.set("__native_buffer_free", Func::from(native_buffer_free))?;
     globals.set("__native_exec", Func::from(native_exec))?;
     globals.set("__native_exec_chain", Func::from(native_exec_chain))?;
-    let cache_scope_for_host_call = cache_scope_id.clone();
+    let runtime_name_for_host_call = runtime_name.clone();
     globals.set(
         "__host_call",
         Function::new(
             ctx.clone(),
             move |name: String, args_json: Option<String>| {
-                host_call(cache_scope_for_host_call.clone(), name, args_json)
+                host_call(runtime_name_for_host_call.clone(), name, args_json)
             },
         )?,
     )?;
-    let cache_scope_for_host_call_start = cache_scope_id.clone();
+    let runtime_name_for_host_call_start = runtime_name.clone();
     globals.set(
         "__host_call_start",
         Function::new(
             ctx.clone(),
             move |name: String, args_json: Option<String>| {
-                host_call_start(cache_scope_for_host_call_start.clone(), name, args_json)
+                host_call_start(runtime_name_for_host_call_start.clone(), name, args_json)
             },
         )?,
     )?;
@@ -209,44 +193,6 @@ pub fn install_host_bindings(
         globals.set("__wasi_run_try_take", Func::from(wasi_run_try_take))?;
         globals.set("__wasi_run_drop", Func::from(wasi_run_drop))?;
     }
-    let cache_scope_for_set = cache_scope_id.clone();
-    globals.set(
-        "__cache_set",
-        Function::new(ctx.clone(), move |key: String, value_json: String| {
-            cache_set(cache_scope_for_set.clone(), key, value_json)
-        })?,
-    )?;
-    let cache_scope_for_set_if_absent = cache_scope_id.clone();
-    globals.set(
-        "__cache_set_if_absent",
-        Function::new(ctx.clone(), move |key: String, value_json: String| {
-            cache_set_if_absent(cache_scope_for_set_if_absent.clone(), key, value_json)
-        })?,
-    )?;
-    let cache_scope_for_cas = cache_scope_id.clone();
-    globals.set(
-        "__cache_compare_and_set",
-        Function::new(
-            ctx.clone(),
-            move |key: String, expected_json: String, value_json: String| {
-                cache_compare_and_set(cache_scope_for_cas.clone(), key, expected_json, value_json)
-            },
-        )?,
-    )?;
-    let cache_scope_for_get = cache_scope_id.clone();
-    globals.set(
-        "__cache_get",
-        Function::new(ctx.clone(), move |key: String| {
-            cache_get(cache_scope_for_get.clone(), key)
-        })?,
-    )?;
-    let cache_scope_for_delete = cache_scope_id.clone();
-    globals.set(
-        "__cache_delete",
-        Function::new(ctx.clone(), move |key: String| {
-            cache_delete(cache_scope_for_delete.clone(), key)
-        })?,
-    )?;
     globals.set("__log_emit", Func::from(log_emit))?;
     globals.set("__runtime_stats", Func::from(runtime_stats))?;
     globals.set("__crypto_sha256_b64", Func::from(crypto_sha256_b64))?;
@@ -330,7 +276,6 @@ static FS_STALE_DROPS: AtomicU64 = AtomicU64::new(0);
 static TIMER_STALE_DROPS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "wasi")]
 static WASI_STALE_DROPS: AtomicU64 = AtomicU64::new(0);
-static CACHE_TX: OnceLock<mpsc::Sender<CacheCommand>> = OnceLock::new();
 static LOG_TX: OnceLock<mpsc::Sender<LogEvent>> = OnceLock::new();
 static LOG_HTTP_ENDPOINT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static LOG_HTTP_DIRECT_CLIENT: OnceLock<Client> = OnceLock::new();
@@ -339,21 +284,8 @@ static LOG_WRITTEN: AtomicU64 = AtomicU64::new(0);
 static LOG_DROPPED: AtomicU64 = AtomicU64::new(0);
 static LOG_ERRORS: AtomicU64 = AtomicU64::new(0);
 static LOG_PENDING: AtomicU64 = AtomicU64::new(0);
-type PluginConfigHandler =
-    Arc<dyn Fn(String, String, String) -> AnyResult<String> + Send + Sync + 'static>;
-type PluginConfigFuture = Pin<Box<dyn Future<Output = AnyResult<String>> + Send + 'static>>;
-type PluginConfigAsyncHandler =
-    Arc<dyn Fn(String, String, String) -> PluginConfigFuture + Send + Sync + 'static>;
-type BridgeRouteHandler = Arc<dyn Fn(String, Vec<Value>) -> AnyResult<Value> + Send + Sync + 'static>;
 type BridgeRouteFuture = Pin<Box<dyn Future<Output = AnyResult<Value>> + Send + 'static>>;
 type BridgeRouteAsyncHandler = Arc<dyn Fn(String, Vec<Value>) -> BridgeRouteFuture + Send + Sync + 'static>;
-static SAVE_PLUGIN_CONFIG_HANDLER: OnceLock<Mutex<Option<PluginConfigHandler>>> = OnceLock::new();
-static LOAD_PLUGIN_CONFIG_HANDLER: OnceLock<Mutex<Option<PluginConfigHandler>>> = OnceLock::new();
-static SAVE_PLUGIN_CONFIG_ASYNC_HANDLER: OnceLock<Mutex<Option<PluginConfigAsyncHandler>>> =
-    OnceLock::new();
-static LOAD_PLUGIN_CONFIG_ASYNC_HANDLER: OnceLock<Mutex<Option<PluginConfigAsyncHandler>>> =
-    OnceLock::new();
-static BRIDGE_ROUTE_HANDLERS: OnceLock<Mutex<HashMap<String, BridgeRouteHandler>>> = OnceLock::new();
 static BRIDGE_ROUTE_ASYNC_HANDLERS: OnceLock<Mutex<HashMap<String, BridgeRouteAsyncHandler>>> =
     OnceLock::new();
 
@@ -389,33 +321,6 @@ impl Default for HttpClientConfig {
     }
 }
 
-enum CacheCommand {
-    Set {
-        key: String,
-        value_json: String,
-        reply_tx: mpsc::Sender<String>,
-    },
-    SetIfAbsent {
-        key: String,
-        value_json: String,
-        reply_tx: mpsc::Sender<String>,
-    },
-    CompareAndSet {
-        key: String,
-        expected_json: String,
-        value_json: String,
-        reply_tx: mpsc::Sender<String>,
-    },
-    Get {
-        key: String,
-        reply_tx: mpsc::Sender<String>,
-    },
-    Delete {
-        key: String,
-        reply_tx: mpsc::Sender<String>,
-    },
-}
-
 struct LogEvent {
     level: String,
     message: String,
@@ -430,87 +335,8 @@ fn bridge_req_pool() -> &'static Mutex<HashMap<u64, PendingTask>> {
     BRIDGE_REQ_POOL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn save_plugin_config_handler_cell() -> &'static Mutex<Option<PluginConfigHandler>> {
-    SAVE_PLUGIN_CONFIG_HANDLER.get_or_init(|| Mutex::new(None))
-}
-
-fn load_plugin_config_handler_cell() -> &'static Mutex<Option<PluginConfigHandler>> {
-    LOAD_PLUGIN_CONFIG_HANDLER.get_or_init(|| Mutex::new(None))
-}
-
-fn save_plugin_config_async_handler_cell() -> &'static Mutex<Option<PluginConfigAsyncHandler>> {
-    SAVE_PLUGIN_CONFIG_ASYNC_HANDLER.get_or_init(|| Mutex::new(None))
-}
-
-fn load_plugin_config_async_handler_cell() -> &'static Mutex<Option<PluginConfigAsyncHandler>> {
-    LOAD_PLUGIN_CONFIG_ASYNC_HANDLER.get_or_init(|| Mutex::new(None))
-}
-
-fn bridge_route_handler_cell() -> &'static Mutex<HashMap<String, BridgeRouteHandler>> {
-    BRIDGE_ROUTE_HANDLERS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 fn bridge_route_async_handler_cell() -> &'static Mutex<HashMap<String, BridgeRouteAsyncHandler>> {
     BRIDGE_ROUTE_ASYNC_HANDLERS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-pub fn register_save_plugin_config_handler<F>(handler: F)
-where
-    F: Fn(String, String, String) -> AnyResult<String> + Send + Sync + 'static,
-{
-    if let Ok(mut guard) = save_plugin_config_handler_cell().lock() {
-        *guard = Some(Arc::new(handler));
-    }
-}
-
-pub fn register_load_plugin_config_handler<F>(handler: F)
-where
-    F: Fn(String, String, String) -> AnyResult<String> + Send + Sync + 'static,
-{
-    if let Ok(mut guard) = load_plugin_config_handler_cell().lock() {
-        *guard = Some(Arc::new(handler));
-    }
-}
-
-pub fn register_save_plugin_config_async_handler<F, Fut>(handler: F)
-where
-    F: Fn(String, String, String) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = AnyResult<String>> + Send + 'static,
-{
-    let wrapped = Arc::new(move |runtime_name: String, key: String, value: String| {
-        Box::pin(handler(runtime_name, key, value)) as PluginConfigFuture
-    }) as PluginConfigAsyncHandler;
-    if let Ok(mut guard) = save_plugin_config_async_handler_cell().lock() {
-        *guard = Some(wrapped);
-    }
-}
-
-pub fn register_load_plugin_config_async_handler<F, Fut>(handler: F)
-where
-    F: Fn(String, String, String) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = AnyResult<String>> + Send + 'static,
-{
-    let wrapped = Arc::new(move |runtime_name: String, key: String, value: String| {
-        Box::pin(handler(runtime_name, key, value)) as PluginConfigFuture
-    }) as PluginConfigAsyncHandler;
-    if let Ok(mut guard) = load_plugin_config_async_handler_cell().lock() {
-        *guard = Some(wrapped);
-    }
-}
-
-pub fn register_bridge_route_handler<F>(name: impl Into<String>, handler: F) -> AnyResult<()>
-where
-    F: Fn(String, Vec<Value>) -> AnyResult<Value> + Send + Sync + 'static,
-{
-    let name = name.into().trim().to_string();
-    if name.is_empty() {
-        return Err(anyhow!("bridge 路由名不能为空"));
-    }
-    let mut handlers = bridge_route_handler_cell()
-        .lock()
-        .map_err(|_| anyhow!("bridge 路由表锁已损坏"))?;
-    handlers.insert(name, Arc::new(handler));
-    Ok(())
 }
 
 pub fn register_bridge_route_async_handler<F, Fut>(
@@ -536,27 +362,11 @@ where
 }
 
 pub fn unregister_bridge_route_handler(name: &str) -> AnyResult<bool> {
-    let mut handlers = bridge_route_handler_cell()
-        .lock()
-        .map_err(|_| anyhow!("bridge 路由表锁已损坏"))?;
-    let removed_sync = handlers.remove(name).is_some();
-    drop(handlers);
-
     let mut async_handlers = bridge_route_async_handler_cell()
         .lock()
         .map_err(|_| anyhow!("bridge 异步路由表锁已损坏"))?;
     let removed_async = async_handlers.remove(name).is_some();
-    Ok(removed_sync || removed_async)
-}
-
-fn call_registered_bridge_route(runtime_name: String, name: String, args: Vec<Value>) -> AnyResult<Value> {
-    let handler = bridge_route_handler_cell()
-        .lock()
-        .map_err(|_| anyhow!("bridge 路由表锁已损坏"))?
-        .get(&name)
-        .cloned()
-        .ok_or_else(|| anyhow!("不支持的 bridge 方法: {name}"))?;
-    handler(runtime_name, args)
+    Ok(removed_async)
 }
 
 async fn call_registered_bridge_route_async(
@@ -564,15 +374,6 @@ async fn call_registered_bridge_route_async(
     name: String,
     args: Vec<Value>,
 ) -> AnyResult<Value> {
-    if let Some(sync_handler) = bridge_route_handler_cell()
-        .lock()
-        .map_err(|_| anyhow!("bridge 路由表锁已损坏"))?
-        .get(&name)
-        .cloned()
-    {
-        return sync_handler(runtime_name, args);
-    }
-
     let async_handler = bridge_route_async_handler_cell()
         .lock()
         .map_err(|_| anyhow!("bridge 异步路由表锁已损坏"))?
@@ -580,66 +381,6 @@ async fn call_registered_bridge_route_async(
         .cloned()
         .ok_or_else(|| anyhow!("不支持的 bridge 方法: {name}"))?;
     async_handler(runtime_name, args).await
-}
-
-fn call_registered_save_plugin_config(
-    runtime_name: String,
-    key: String,
-    value: String,
-) -> AnyResult<String> {
-    let handler = save_plugin_config_handler_cell()
-        .lock()
-        .map_err(|_| anyhow!("save_plugin_config 回调锁已损坏"))?
-        .clone()
-        .ok_or_else(|| anyhow!("save_plugin_config 回调未注册"))?;
-    handler(runtime_name, key, value)
-}
-
-fn call_registered_load_plugin_config(
-    runtime_name: String,
-    key: String,
-    value: String,
-) -> AnyResult<String> {
-    let handler = load_plugin_config_handler_cell()
-        .lock()
-        .map_err(|_| anyhow!("load_plugin_config 回调锁已损坏"))?
-        .clone()
-        .ok_or_else(|| anyhow!("load_plugin_config 回调未注册"))?;
-    handler(runtime_name, key, value)
-}
-
-async fn call_registered_save_plugin_config_async(
-    runtime_name: String,
-    key: String,
-    value: String,
-) -> AnyResult<String> {
-    let handler = {
-        save_plugin_config_async_handler_cell()
-            .lock()
-            .map_err(|_| anyhow!("save_plugin_config 异步回调锁已损坏"))?
-            .clone()
-    };
-    if let Some(handler) = handler {
-        return handler(runtime_name, key, value).await;
-    }
-    call_registered_save_plugin_config(runtime_name, key, value)
-}
-
-async fn call_registered_load_plugin_config_async(
-    runtime_name: String,
-    key: String,
-    value: String,
-) -> AnyResult<String> {
-    let handler = {
-        load_plugin_config_async_handler_cell()
-            .lock()
-            .map_err(|_| anyhow!("load_plugin_config 异步回调锁已损坏"))?
-            .clone()
-    };
-    if let Some(handler) = handler {
-        return handler(runtime_name, key, value).await;
-    }
-    call_registered_load_plugin_config(runtime_name, key, value)
 }
 
 fn http_req_event_pool() -> &'static Mutex<HashMap<u64, PendingAbortTask>> {
@@ -1090,110 +831,6 @@ async fn run_wasi_transform_once(plan: &WasiTransformPlan, input: Vec<u8>) -> An
 #[cfg(not(feature = "wasi"))]
 async fn run_wasi_transform_once(_plan: &WasiTransformPlan, _input: Vec<u8>) -> AnyResult<Vec<u8>> {
     Err(anyhow!("当前构建未启用 wasi Cargo 特性"))
-}
-
-fn cache_sender() -> &'static mpsc::Sender<CacheCommand> {
-    CACHE_TX.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<CacheCommand>();
-        thread::Builder::new()
-            .name("rquickjs-cache-worker".to_string())
-            .spawn(move || {
-                let mut map: HashMap<String, Value> = HashMap::new();
-                while let Ok(cmd) = rx.recv() {
-                    match cmd {
-                        CacheCommand::Set {
-                            key,
-                            value_json,
-                            reply_tx,
-                        } => {
-                            let out = match serde_json::from_str::<Value>(&value_json) {
-                                Ok(value) => {
-                                    map.insert(key, value);
-                                    json!({ "ok": true }).to_string()
-                                }
-                                Err(e) => {
-                                    json!({ "ok": false, "error": format!("value 不是合法 JSON: {e}") }).to_string()
-                                }
-                            };
-                            let _ = reply_tx.send(out);
-                        }
-                        CacheCommand::SetIfAbsent {
-                            key,
-                            value_json,
-                            reply_tx,
-                        } => {
-                            let out = match serde_json::from_str::<Value>(&value_json) {
-                                Ok(value) => {
-                                    if map.contains_key(&key) {
-                                        json!({ "ok": true, "inserted": false }).to_string()
-                                    } else {
-                                        map.insert(key, value);
-                                        json!({ "ok": true, "inserted": true }).to_string()
-                                    }
-                                }
-                                Err(e) => {
-                                    json!({ "ok": false, "error": format!("value 不是合法 JSON: {e}") }).to_string()
-                                }
-                            };
-                            let _ = reply_tx.send(out);
-                        }
-                        CacheCommand::CompareAndSet {
-                            key,
-                            expected_json,
-                            value_json,
-                            reply_tx,
-                        } => {
-                            let expected = match serde_json::from_str::<Value>(&expected_json) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    let _ = reply_tx.send(
-                                        json!({ "ok": false, "error": format!("expected 不是合法 JSON: {e}") })
-                                            .to_string(),
-                                    );
-                                    continue;
-                                }
-                            };
-                            let next = match serde_json::from_str::<Value>(&value_json) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    let _ = reply_tx.send(
-                                        json!({ "ok": false, "error": format!("value 不是合法 JSON: {e}") })
-                                            .to_string(),
-                                    );
-                                    continue;
-                                }
-                            };
-
-                            let updated = match map.get(&key) {
-                                Some(current) if *current == expected => {
-                                    map.insert(key, next);
-                                    true
-                                }
-                                _ => false,
-                            };
-                            let _ = reply_tx.send(json!({ "ok": true, "updated": updated }).to_string());
-                        }
-                        CacheCommand::Get { key, reply_tx } => {
-                            let out = match map.get(&key) {
-                                Some(v) => {
-                                    json!({ "ok": true, "found": true, "value": v.clone() }).to_string()
-                                }
-                                None => {
-                                    json!({ "ok": true, "found": false, "value": Value::Null }).to_string()
-                                }
-                            };
-                            let _ = reply_tx.send(out);
-                        }
-                        CacheCommand::Delete { key, reply_tx } => {
-                            let existed = map.remove(&key).is_some();
-                            let _ = reply_tx.send(json!({ "ok": true, "deleted": existed }).to_string());
-                        }
-                    }
-                }
-            })
-            .expect("创建 cache worker 失败");
-        tx
-    })
 }
 
 const LOG_MAX_PENDING: u64 = 16_384;
@@ -1917,127 +1554,7 @@ fn fs_task_dispatch(op: String, args_json: String) -> String {
     }
 }
 
-pub fn cache_set(cache_scope_id: String, key: String, value_json: String) -> String {
-    if let Err(err) = validate_cache_key(&key) {
-        return json!({ "ok": false, "error": format!("{err:#}") }).to_string();
-    }
-    let key = qualify_cache_key(&cache_scope_id, &key);
-    let (reply_tx, reply_rx) = mpsc::channel::<String>();
-    if let Err(e) = cache_sender().send(CacheCommand::Set {
-        key,
-        value_json,
-        reply_tx,
-    }) {
-        return json!({ "ok": false, "error": format!("cache worker 不可用: {e}") }).to_string();
-    }
-    match reply_rx.recv() {
-        Ok(raw) => raw,
-        Err(e) => {
-            json!({ "ok": false, "error": format!("cache worker 响应失败: {e}") }).to_string()
-        }
-    }
-}
-
-pub fn cache_set_if_absent(cache_scope_id: String, key: String, value_json: String) -> String {
-    if let Err(err) = validate_cache_key(&key) {
-        return json!({ "ok": false, "error": format!("{err:#}") }).to_string();
-    }
-    let key = qualify_cache_key(&cache_scope_id, &key);
-    let (reply_tx, reply_rx) = mpsc::channel::<String>();
-    if let Err(e) = cache_sender().send(CacheCommand::SetIfAbsent {
-        key,
-        value_json,
-        reply_tx,
-    }) {
-        return json!({ "ok": false, "error": format!("cache worker 不可用: {e}") }).to_string();
-    }
-    match reply_rx.recv() {
-        Ok(raw) => raw,
-        Err(e) => {
-            json!({ "ok": false, "error": format!("cache worker 响应失败: {e}") }).to_string()
-        }
-    }
-}
-
-pub fn cache_compare_and_set(
-    cache_scope_id: String,
-    key: String,
-    expected_json: String,
-    value_json: String,
-) -> String {
-    if let Err(err) = validate_cache_key(&key) {
-        return json!({ "ok": false, "error": format!("{err:#}") }).to_string();
-    }
-    let key = qualify_cache_key(&cache_scope_id, &key);
-    let (reply_tx, reply_rx) = mpsc::channel::<String>();
-    if let Err(e) = cache_sender().send(CacheCommand::CompareAndSet {
-        key,
-        expected_json,
-        value_json,
-        reply_tx,
-    }) {
-        return json!({ "ok": false, "error": format!("cache worker 不可用: {e}") }).to_string();
-    }
-    match reply_rx.recv() {
-        Ok(raw) => raw,
-        Err(e) => {
-            json!({ "ok": false, "error": format!("cache worker 响应失败: {e}") }).to_string()
-        }
-    }
-}
-
-pub fn cache_get(cache_scope_id: String, key: String) -> String {
-    if let Err(err) = validate_cache_key(&key) {
-        return json!({ "ok": false, "error": format!("{err:#}") }).to_string();
-    }
-    let key = qualify_cache_key(&cache_scope_id, &key);
-    let (reply_tx, reply_rx) = mpsc::channel::<String>();
-    if let Err(e) = cache_sender().send(CacheCommand::Get { key, reply_tx }) {
-        return json!({ "ok": false, "error": format!("cache worker 不可用: {e}") }).to_string();
-    }
-    match reply_rx.recv() {
-        Ok(raw) => raw,
-        Err(e) => {
-            json!({ "ok": false, "error": format!("cache worker 响应失败: {e}") }).to_string()
-        }
-    }
-}
-
-pub fn cache_delete(cache_scope_id: String, key: String) -> String {
-    if let Err(err) = validate_cache_key(&key) {
-        return json!({ "ok": false, "error": format!("{err:#}") }).to_string();
-    }
-    let key = qualify_cache_key(&cache_scope_id, &key);
-    let (reply_tx, reply_rx) = mpsc::channel::<String>();
-    if let Err(e) = cache_sender().send(CacheCommand::Delete { key, reply_tx }) {
-        return json!({ "ok": false, "error": format!("cache worker 不可用: {e}") }).to_string();
-    }
-    match reply_rx.recv() {
-        Ok(raw) => raw,
-        Err(e) => {
-            json!({ "ok": false, "error": format!("cache worker 响应失败: {e}") }).to_string()
-        }
-    }
-}
-
-fn validate_cache_key(key: &str) -> AnyResult<()> {
-    let raw = key.trim();
-    if raw.is_empty() {
-        return Err(anyhow!("cache key 不能为空"));
-    }
-    if raw.chars().count() > 240 {
-        return Err(anyhow!("cache key 长度不能超过 240 字符"));
-    }
-    if raw.chars().any(|c| c.is_control()) {
-        return Err(anyhow!("cache key 不能包含控制字符"));
-    }
-    if raw.starts_with(':') || raw.ends_with(':') {
-        return Err(anyhow!("cache key 不能以 ':' 开头或结尾"));
-    }
-    Ok(())
-}
-
-fn normalize_runtime_cache_scope_id(input: &str) -> String {
+fn normalize_runtime_name(input: &str) -> String {
     let raw = input.trim();
     if raw.is_empty() {
         return "default-runtime".to_string();
@@ -2060,10 +1577,6 @@ fn normalize_runtime_cache_scope_id(input: &str) -> String {
     } else {
         out
     }
-}
-
-fn qualify_cache_key(cache_scope_id: &str, key: &str) -> String {
-    format!("rid::{cache_scope_id}::{key}")
 }
 
 pub fn log_emit(level: String, message: String) -> String {
@@ -3024,182 +2537,6 @@ pub fn call_js_global_function(
     }
 }
 
-fn ensure_plugin_registry(ctx: &Ctx<'_>) -> AnyResult<()> {
-    ctx.eval::<(), _>(
-        r#"
-        (() => {
-          const key = "__host_plugin_registry";
-          if (!(globalThis[key] instanceof Map)) {
-            Object.defineProperty(globalThis, key, {
-              value: new Map(),
-              writable: false,
-              enumerable: false,
-              configurable: false,
-            });
-          }
-        })();
-        "#,
-    )
-    .context("初始化插件注册表失败")
-}
-
-fn eval_json_payload_script(
-    ctx: &Ctx<'_>,
-    script: String,
-    error_context: &'static str,
-) -> AnyResult<Value> {
-    let promise: Promise = ctx.eval(script).context(error_context)?;
-    let raw: String = promise.finish().context("等待 JS Promise 失败")?;
-    let payload: Value = serde_json::from_str(&raw).context("解析 JS 返回 JSON 失败")?;
-    if payload.get("ok").and_then(Value::as_bool) == Some(true) {
-        Ok(payload.get("data").cloned().unwrap_or(Value::Null))
-    } else {
-        Err(anyhow!(
-            "{}",
-            payload
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("调用失败")
-        ))
-    }
-}
-
-pub fn plugin_load_bundle(ctx: &Ctx<'_>, name: String, script: String) -> AnyResult<()> {
-    ensure_plugin_registry(ctx)?;
-
-    let name_json = serde_json::to_string(&name).context("序列化插件名失败")?;
-    let script_json = serde_json::to_string(&script).context("序列化插件脚本失败")?;
-
-    let load_script = format!(
-        r#"
-        (async () => {{
-          try {{
-            const pluginName = {name_json};
-            const source = {script_json};
-            const registry = globalThis.__host_plugin_registry;
-            if (!(registry instanceof Map)) {{
-              throw new TypeError("插件注册表不可用");
-            }}
-
-            const module = {{ exports: {{}} }};
-            const exports = module.exports;
-            const requireFn = typeof globalThis.require === "function"
-              ? globalThis.require.bind(globalThis)
-              : undefined;
-            const runner = new Function("module", "exports", "require", source);
-            runner(module, exports, requireFn);
-
-            let api = module.exports;
-            if (api && typeof api === "object" && api.default !== undefined) {{
-              api = api.default;
-            }}
-            if (typeof api === "function") {{
-              api = {{ default: api }};
-            }}
-            if (!api || typeof api !== "object") {{
-              throw new TypeError("插件必须导出对象或默认对象导出");
-            }}
-
-            registry.set(pluginName, api);
-            return JSON.stringify({{ ok: true, data: null }});
-          }} catch (err) {{
-            const message = String(err && (err.stack || err.message) ? (err.stack || err.message) : err);
-            return JSON.stringify({{ ok: false, error: message }});
-          }}
-        }})()
-        "#
-    );
-
-    eval_json_payload_script(ctx, load_script, "加载插件 bundle 失败")?;
-    Ok(())
-}
-
-pub fn plugin_call(
-    ctx: &Ctx<'_>,
-    plugin_name: String,
-    function_name: String,
-    args_json: Option<String>,
-) -> AnyResult<Value> {
-    ensure_plugin_registry(ctx)?;
-
-    let args = parse_bridge_args(args_json)?;
-    let plugin_name_json = serde_json::to_string(&plugin_name).context("序列化插件名失败")?;
-    let function_name_json = serde_json::to_string(&function_name).context("序列化函数名失败")?;
-    let args_literal = serde_json::to_string(&args).context("序列化插件调用参数失败")?;
-
-    let script = format!(
-        r#"
-        (async () => {{
-          try {{
-            const pluginName = {plugin_name_json};
-            const fnName = {function_name_json};
-            const args = {args_literal};
-            const registry = globalThis.__host_plugin_registry;
-            if (!(registry instanceof Map)) {{
-              throw new TypeError("插件注册表不可用");
-            }}
-
-            const api = registry.get(pluginName);
-            if (!api || typeof api !== "object") {{
-              throw new Error(`插件不存在: ${{pluginName}}`);
-            }}
-
-            const fn = api[fnName];
-            if (typeof fn !== "function") {{
-              throw new Error(`插件 ${{pluginName}} 未导出函数: ${{fnName}}`);
-            }}
-
-            const data = await fn.apply(api, args);
-            return JSON.stringify({{ ok: true, data }});
-          }} catch (err) {{
-            const message = String(err && (err.stack || err.message) ? (err.stack || err.message) : err);
-            return JSON.stringify({{ ok: false, error: message }});
-          }}
-        }})()
-        "#
-    );
-
-    eval_json_payload_script(ctx, script, "执行插件函数失败")
-}
-
-pub fn plugin_get_info(ctx: &Ctx<'_>, name: String) -> AnyResult<Value> {
-    plugin_call(ctx, name, "getInfo".to_string(), None)
-}
-
-pub fn plugin_list(ctx: &Ctx<'_>) -> AnyResult<Value> {
-    ensure_plugin_registry(ctx)?;
-    let script = r#"
-        (async () => {
-          try {
-            const registry = globalThis.__host_plugin_registry;
-            if (!(registry instanceof Map)) {
-              throw new TypeError("插件注册表不可用");
-            }
-
-            const list = [];
-            for (const [name, api] of registry.entries()) {
-              if (api && typeof api.getInfo === "function") {
-                const info = await api.getInfo();
-                if (info && typeof info === "object" && !Array.isArray(info)) {
-                  list.push({ ...info, name: String(info.name || name) });
-                  continue;
-                }
-              }
-              list.push({ name });
-            }
-
-            return JSON.stringify({ ok: true, data: list });
-          } catch (err) {
-            const message = String(err && (err.stack || err.message) ? (err.stack || err.message) : err);
-            return JSON.stringify({ ok: false, error: message });
-          }
-        })()
-    "#
-    .to_string();
-
-    eval_json_payload_script(ctx, script, "读取插件列表失败")
-}
-
 fn require_arg<'a>(args: &'a [Value], index: usize, name: &str) -> AnyResult<&'a Value> {
     args.get(index).ok_or_else(|| anyhow!("缺少参数: {name}"))
 }
@@ -3288,7 +2625,7 @@ fn compression_gzip_compress(input: Vec<u8>) -> AnyResult<Value> {
 }
 
 fn bridge_call_inner(
-    runtime_name: String,
+    _runtime_name: String,
     name: String,
     args_json: Option<String>,
 ) -> AnyResult<Value> {
@@ -3348,19 +2685,7 @@ fn bridge_call_inner(
             let input = parse_u8_json_value(require_arg(&args, 0, "input")?)?;
             compression_gzip_compress(input)
         }
-        "save_plugin_config" | "plugin_config.save_plugin_config" => {
-            let key = require_str_arg(&args, 0, "key")?;
-            let value = require_str_arg(&args, 1, "value")?;
-            let out = call_registered_save_plugin_config(runtime_name, key, value)?;
-            Ok(json!(out))
-        }
-        "load_plugin_config" | "plugin_config.load_plugin_config" => {
-            let key = require_str_arg(&args, 0, "key")?;
-            let value = require_str_arg(&args, 1, "value")?;
-            let out = call_registered_load_plugin_config(runtime_name, key, value)?;
-            Ok(json!(out))
-        }
-        _ => call_registered_bridge_route(runtime_name, name, args),
+        _ => Err(anyhow!("不支持的 bridge 方法: {name}")),
     }
 }
 
@@ -3424,18 +2749,6 @@ async fn bridge_call_inner_async(
         "compression.gzip_compress" => {
             let input = parse_u8_json_value(require_arg(&args, 0, "input")?)?;
             compression_gzip_compress(input)
-        }
-        "save_plugin_config" | "plugin_config.save_plugin_config" => {
-            let key = require_str_arg(&args, 0, "key")?;
-            let value = require_str_arg(&args, 1, "value")?;
-            let out = call_registered_save_plugin_config_async(runtime_name, key, value).await?;
-            Ok(json!(out))
-        }
-        "load_plugin_config" | "plugin_config.load_plugin_config" => {
-            let key = require_str_arg(&args, 0, "key")?;
-            let value = require_str_arg(&args, 1, "value")?;
-            let out = call_registered_load_plugin_config_async(runtime_name, key, value).await?;
-            Ok(json!(out))
         }
         _ => call_registered_bridge_route_async(runtime_name, name, args).await,
     }

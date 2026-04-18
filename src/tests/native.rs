@@ -2,8 +2,7 @@ use crate::tests::run_async_script;
 #[cfg(feature = "wasi")]
 use crate::tests::run_async_script_with_wasi;
 use crate::{
-    register_bridge_route_async_handler, register_bridge_route_handler,
-    unregister_bridge_route_handler,
+    register_bridge_route_async_handler, unregister_bridge_route_handler,
 };
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -596,7 +595,7 @@ fn bridge_call_with_external_route_handler() {
         BRIDGE_ROUTE_SEQ.fetch_add(1, Ordering::Relaxed)
     );
 
-    register_bridge_route_handler(route.clone(), |runtime_name, args| {
+    register_bridge_route_async_handler(route.clone(), |runtime_name, args| async move {
         let first = args.first().cloned().unwrap_or(Value::Null);
         Ok(json!({
             "runtime": runtime_name,

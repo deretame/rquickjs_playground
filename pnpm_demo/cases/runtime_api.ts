@@ -21,12 +21,6 @@ export default async function main(config: unknown = {}) {
   const bridge = requireApi("bridge");
   const bridgeSum = await bridge.call("math.add", 1.5, 2) as number;
 
-  const cache = requireApi("cache");
-  const scopedKey = "runtime-api-plugin::k";
-  cache.set(scopedKey, { x: 1 });
-  const scopedValue = cache.get(scopedKey) as { x?: number };
-  const deleted = cache.delete(scopedKey);
-
   const native = requireApi("native");
   const nativeOut = await native.chain(["invert", "invert"], new Uint8Array([1, 2, 3]));
 
@@ -62,8 +56,6 @@ export default async function main(config: unknown = {}) {
     && uuidOk
     && joined === "/a/c.txt"
     && bridgeSum === 3.5
-    && scopedValue.x === 1
-    && deleted === true
     && nativeOut[0] === 1
     && nativeOut[1] === 2
     && nativeOut[2] === 3

@@ -15,7 +15,7 @@ import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { tmpdir } from "node:os";
 
-const caseNames = ["fetch", "axios", "fs", "native", "runtime", "runtime_api", "wasi", "cache", "bridge"];
+const caseNames = ["fetch", "axios", "fs", "native", "runtime", "runtime_api", "wasi", "bridge"];
 
 function toUint8Array(input) {
   if (input instanceof Uint8Array) return new Uint8Array(input);
@@ -216,70 +216,6 @@ function createRuntimeAdapters() {
     },
   };
 
-  const cacheStore = new Map();
-  const cache = {
-    set(key, value) {
-      cacheStore.set(String(key), value);
-      return value;
-    },
-    setIfAbsent(key, value) {
-      const k = String(key);
-      if (cacheStore.has(k)) return false;
-      cacheStore.set(k, value);
-      return true;
-    },
-    compareAndSet(key, expected, value) {
-      const k = String(key);
-      if (!cacheStore.has(k)) return false;
-      const current = cacheStore.get(k);
-      if (JSON.stringify(current) !== JSON.stringify(expected)) return false;
-      cacheStore.set(k, value);
-      return true;
-    },
-    get(key, fallback = null) {
-      const k = String(key);
-      return cacheStore.has(k) ? cacheStore.get(k) : fallback;
-    },
-    has(key) {
-      return cacheStore.has(String(key));
-    },
-    delete(key) {
-      return cacheStore.delete(String(key));
-    },
-    scoped(pluginName) {
-      const ns = String(pluginName || "").trim();
-      if (!ns) throw new TypeError("pluginName 不能为空");
-      if (ns.length > 200) throw new TypeError("pluginName 长度不能超过 200 字符");
-      const prefix = `plg_${createHash("sha256").update(ns, "utf8").digest("hex")}`;
-      const withPrefix = (key) => {
-        const localKey = String(key || "").trim();
-        if (!localKey) throw new TypeError("cache key 不能为空");
-        if (localKey.length > 200) throw new TypeError("cache key 长度不能超过 200 字符");
-        const keyHash = createHash("sha256").update(localKey, "utf8").digest("hex");
-        return `${prefix}::${keyHash}`;
-      };
-      return {
-        set: (key, value) => cache.set(withPrefix(key), value),
-        setIfAbsent: (key, value) => cache.setIfAbsent(withPrefix(key), value),
-        compareAndSet: (key, expected, value) => cache.compareAndSet(withPrefix(key), expected, value),
-        get: (key, fallback = null) => cache.get(withPrefix(key), fallback),
-        has: (key) => cache.has(withPrefix(key)),
-        delete: (key) => cache.delete(withPrefix(key)),
-        clearAll: () => {
-          let deleted = 0;
-          const marker = `${prefix}::`;
-          for (const k of Array.from(cacheStore.keys())) {
-            if (k.startsWith(marker)) {
-              cacheStore.delete(k);
-              deleted += 1;
-            }
-          }
-          return deleted;
-        },
-      };
-    },
-  };
-
   const bridge = {
     async call(name, ...args) {
       const method = String(name || "");
@@ -308,7 +244,6 @@ function createRuntimeAdapters() {
         rm,
       },
     },
-    cache,
     bridge,
     nodeCryptoCompat: {
       createHash,

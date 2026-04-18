@@ -77,14 +77,6 @@
     return parseHost(raw);
   }
 
-  async function savePluginConfig(key, value) {
-    return call("save_plugin_config", String(key), String(value));
-  }
-
-  async function loadPluginConfig(key, value) {
-    return call("load_plugin_config", String(key), String(value));
-  }
-
   async function gzipDecompress(input) {
     const out = await call("compression.gzip_decompress", input);
     return Uint8Array.from(Array.isArray(out) ? out : []);
@@ -99,10 +91,5 @@
     call,
     gzipDecompress,
     gzipCompress,
-  };
-
-  globalThis.__web.pluginConfig = {
-    savePluginConfig,
-    loadPluginConfig,
   };
 })();

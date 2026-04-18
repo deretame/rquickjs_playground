@@ -8,10 +8,7 @@ pub use host_runtime::{
 pub use web_runtime::{
     HttpClientConfig, WebRuntimeOptions, configure_http_client, configure_log_http_endpoint,
     current_http_client_config, current_log_http_endpoint, polyfill_script,
-    register_bridge_route_async_handler, register_bridge_route_handler,
-    register_load_plugin_config_async_handler, register_load_plugin_config_handler,
-    register_save_plugin_config_async_handler, register_save_plugin_config_handler,
-    unregister_bridge_route_handler,
+    register_bridge_route_async_handler, unregister_bridge_route_handler,
 };
 
 #[cfg(test)]

@@ -187,12 +187,6 @@ fn compiled_wasi_case_runs() {
 }
 
 #[test]
-fn compiled_cache_case_runs() {
-    let out = run_case("cache", serde_json::json!({}));
-    assert_case_ok(&out);
-}
-
-#[test]
 fn compiled_bridge_case_runs() {
     let out = run_case("bridge", serde_json::json!({}));
     assert_case_ok(&out);

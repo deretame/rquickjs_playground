@@ -36,7 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-说明：`AsyncHostRuntime::new(cache_scope_id)` 默认不注入 `wasi`，而且默认构建也不会编译进 WASI 依赖。如果需要 `wasi`，请在 Cargo 里开启 `wasi` 特性，并改用 `AsyncHostRuntime::new_with_options(cache_scope_id, WebRuntimeOptions { wasi: true })`。宿主会在 Rust 侧自动把 cache key 前缀化，不需要在 JS 里手动拼接 runtime id。
+说明：`AsyncHostRuntime::new(runtime_name)` 默认不注入 `wasi`，而且默认构建也不会编译进 WASI 依赖。如果需要 `wasi`，请在 Cargo 里开启 `wasi` 特性，并改用 `AsyncHostRuntime::new_with_options(runtime_name, WebRuntimeOptions { wasi: true })`。
 
 如果你想运行仓库里的演示：
 
@@ -419,10 +419,7 @@ Rust 侧用法：
 
 ```rust
 use rquickjs::{Context, Runtime};
-use rquickjs_playground::web_runtime::{
-    WEB_POLYFILL, WebRuntimeOptions, plugin_call, plugin_get_info, plugin_load_bundle,
-    polyfill_script,
-};
+use rquickjs_playground::web_runtime::{WebRuntimeOptions, polyfill_script};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = Runtime::new()?;
@@ -431,32 +428,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     context.with(|ctx| {
         ctx.eval::<(), _>(script.as_str())?;
-
-        plugin_load_bundle(
-            &ctx,
-            "image-tools".to_string(),
-            r#"
-            module.exports = {
-              getInfo() {
-                return { name: "image-tools", version: "1.2.3", apiVersion: 1 };
-              },
-              echo(name, version) {
-                return { name, version };
-              }
-            };
-            "#
-            .to_string(),
-        )?;
-
-        let info = plugin_get_info(&ctx, "image-tools".to_string())?;
-        let echoed = plugin_call(
-            &ctx,
-            "image-tools".to_string(),
-            "echo".to_string(),
-            Some("[\"demo\",\"0.0.1\"]".to_string()),
-        )?;
-
-        println!("info={info} echoed={echoed}");
         Ok::<(), anyhow::Error>(())
     })?;
 
@@ -464,7 +435,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-备注：当前加载器按 CJS 方式执行 bundle（`module.exports` / `exports.default`），如果你在 TS 中使用 `import/export`，请先打包成单文件 CJS 再交给宿主加载。
+备注：当前推荐统一走 `bridge.call(...)` + 动态路由注册，避免额外插件模型。
 
 ---
 
@@ -489,9 +460,52 @@ const id = runtime.uuidv4();
 可用能力包括（按需读取）：
 
 - Web API：`fetch`、`Request`、`Response`、`Headers`、`FormData`、`Blob`、`URL` 等
-- Host API：`fs`、`native`、`wasi`、`cache`、`bridge`、`plugin`
+- Host API：`fs`、`native`、`wasi`、`bridge`
 - Runtime API：`crypto/nodeCryptoCompat`、`uuidv4`、`Buffer`、`TextEncoder/TextDecoder`
 
 并且提供了 `getApi(name)`（可选）与 `requireApi(name)`（缺失直接抛错）两套调用方式。
 
-补充：当前 `cache` API 不再提供 `cache.scoped(...)`。如果需要业务内分组，请直接在 key 上自行加前缀（例如 `"jm_http::jwt"`）。实例级隔离由 `AsyncHostRuntime::new(cache_scope_id)` 在 Rust 侧统一处理。
+补充：如需缓存与配置存取，建议在调用方通过动态 bridge 路由自行实现并包装（例如注册 `cache.get/cache.set`、`plugin_config.load/save` 等自定义方法）。
+
+Rust 侧（宿主）动态注册示例：
+
+```rust
+use rquickjs_playground::register_bridge_route_async_handler;
+use serde_json::{json, Value};
+
+register_bridge_route_async_handler("cache.get", |_runtime, args| async move {
+    let key = args
+        .first()
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("missing key"))?;
+    let val = my_cache_get(key).await;
+    Ok(json!(val))
+})?;
+
+register_bridge_route_async_handler("cache.set", |_runtime, args| async move {
+    let key = args
+        .first()
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("missing key"))?;
+    let value = args.get(1).cloned().unwrap_or(Value::Null);
+    my_cache_set(key, value).await?;
+    Ok(json!(true))
+})?;
+```
+
+JS 侧包装成旧调用习惯示例：
+
+```ts
+export const cache = {
+  get: (key: string, fallback: unknown = null) =>
+    bridge.call("cache.get", key).then((v) => (v ?? fallback)),
+  set: (key: string, value: unknown) => bridge.call("cache.set", key, value),
+};
+
+export const pluginConfig = {
+  load: (key: string, def = "") =>
+    bridge.call("plugin_config.load_plugin_config", key, def),
+  save: (key: string, value: string) =>
+    bridge.call("plugin_config.save_plugin_config", key, value),
+};
+```

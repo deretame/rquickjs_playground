@@ -5,38 +5,11 @@ export default async function main() {
     : (...parts: string[]) => parts.join("/").replace(/\/+/g, "/").replace("/images/../", "/");
   const joined = joinPath("/demo", "images", "..", "out.png");
 
-  const pluginConfigApi = (globalThis as unknown as {
-    pluginConfig?: {
-      savePluginConfig?: (key: string, value: string) => Promise<string>;
-      loadPluginConfig?: (key: string, value: string) => Promise<string>;
-    };
-  }).pluginConfig;
-
-  let pluginConfigExample: unknown = null;
-  if (
-    pluginConfigApi
-    && typeof pluginConfigApi.savePluginConfig === "function"
-    && typeof pluginConfigApi.loadPluginConfig === "function"
-  ) {
-    try {
-      await pluginConfigApi.savePluginConfig("demo.token", "abc123");
-      const loaded = await pluginConfigApi.loadPluginConfig("demo.token", "");
-      pluginConfigExample = { key: "demo.token", loadedRaw: loaded };
-    } catch (err: unknown) {
-      pluginConfigExample = {
-        key: "demo.token",
-        skipped: true,
-        reason: err instanceof Error ? err.message : String(err),
-      };
-    }
-  }
-
   if (!globalThis.native || !globalThis.wasi) {
     return {
       ok: true,
       runtime: "node",
       joined,
-      pluginConfigExample,
       note: "native/wasi 不存在，走 Node 回退路径",
     };
   }
@@ -60,7 +33,6 @@ export default async function main() {
   return {
     ok: true,
     joined,
-    pluginConfigExample,
     out: Array.from(out),
     wasi: {
       exitCode: run.exitCode,

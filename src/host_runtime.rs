@@ -235,6 +235,9 @@ enum AsyncCommand {
     Submit { id: u64, script: String },
     Drop { id: u64 },
     DropMany { ids: Vec<u64> },
+    RunGc {
+        tx: oneshot::Sender<Result<(), String>>,
+    },
     Shutdown,
 }
 
@@ -362,6 +365,10 @@ impl HostRuntime {
 
     pub fn options(&self) -> WebRuntimeOptions {
         self.options
+    }
+
+    pub fn run_gc(&self) {
+        self.runtime.run_gc();
     }
 }
 
@@ -620,6 +627,15 @@ impl AsyncHostRuntime {
 
     pub fn options(&self) -> WebRuntimeOptions {
         self.options
+    }
+
+    pub async fn run_gc(&self) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel::<Result<(), String>>();
+        self.tx
+            .send(WorkerSignal::Command(AsyncCommand::RunGc { tx }))
+            .map_err(|_| "触发 GC 失败: worker 不可用".to_string())?;
+        rx.await
+            .map_err(|_| "触发 GC 失败: worker 已关闭".to_string())?
     }
 
     pub async fn bundle_load(&self, name: &str, source: &str) -> Result<(), String> {
@@ -1253,6 +1269,11 @@ fn handle_worker_command(
             for id in ids {
                 mark_dropped_and_notify(states, waiters, id);
             }
+            true
+        }
+        AsyncCommand::RunGc { tx } => {
+            host.run_gc();
+            let _ = tx.send(Ok(()));
             true
         }
         AsyncCommand::Shutdown => false,
