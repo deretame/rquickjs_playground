@@ -119,10 +119,12 @@ fn compiled_axios_case_runs() {
     assert_eq!(out["details"]["getPath"], "/axios-get?x=1");
     assert_eq!(out["details"]["interceptorHeader"], "yes");
     assert_eq!(out["details"]["responseIntercepted"], true);
-    assert!(out["details"]["formDataContentType"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("multipart/form-data"));
+    assert!(
+        out["details"]["formDataContentType"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("multipart/form-data")
+    );
     assert!(out["details"]["formDataBodyLen"].as_u64().unwrap_or(0) > 0);
     let url_body = out["details"]["urlEncodedBody"]
         .as_str()

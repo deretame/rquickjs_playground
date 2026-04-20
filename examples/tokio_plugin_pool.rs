@@ -58,8 +58,9 @@ impl PluginManager {
             workers.push(tx);
 
             thread::spawn(move || {
-                let host = AsyncHostRuntime::new(format!("example-tokio-plugin-worker-{worker_id}"))
-                    .expect("创建 HostRuntime 失败");
+                let host =
+                    AsyncHostRuntime::new(format!("example-tokio-plugin-worker-{worker_id}"))
+                        .expect("创建 HostRuntime 失败");
                 host.spawn(plugin_bootstrap_script())
                     .expect("初始化插件脚本失败")
                     .wait()
@@ -162,7 +163,11 @@ fn invoke_one(host: &AsyncHostRuntime, item: &InvokeItem) -> Result<Value, Strin
         "#
     );
 
-    let raw = host.spawn(&script).map_err(|e| e.to_string())?.wait().map_err(|e| e.to_string())?;
+    let raw = host
+        .spawn(&script)
+        .map_err(|e| e.to_string())?
+        .wait()
+        .map_err(|e| e.to_string())?;
     let payload: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     if payload.get("ok").and_then(Value::as_bool) == Some(true) {
         Ok(payload.get("data").cloned().unwrap_or(Value::Null))
@@ -257,7 +262,11 @@ fn plugin_bootstrap_script() -> &'static str {
     "#
 }
 
-fn get_plugin_info(host: &AsyncHostRuntime, plugin_name: &str, query: &Value) -> Result<Value, String> {
+fn get_plugin_info(
+    host: &AsyncHostRuntime,
+    plugin_name: &str,
+    query: &Value,
+) -> Result<Value, String> {
     let name_json = serde_json::to_string(plugin_name).map_err(|e| e.to_string())?;
     let query_json = serde_json::to_string(query).map_err(|e| e.to_string())?;
 
@@ -274,7 +283,11 @@ fn get_plugin_info(host: &AsyncHostRuntime, plugin_name: &str, query: &Value) ->
         "#
     );
 
-    let raw = host.spawn(&script).map_err(|e| e.to_string())?.wait().map_err(|e| e.to_string())?;
+    let raw = host
+        .spawn(&script)
+        .map_err(|e| e.to_string())?
+        .wait()
+        .map_err(|e| e.to_string())?;
     let payload: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     if payload.get("ok").and_then(Value::as_bool) == Some(true) {
         Ok(payload.get("data").cloned().unwrap_or(Value::Null))

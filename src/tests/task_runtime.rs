@@ -10,8 +10,8 @@ use tokio::sync::oneshot;
 
 #[test]
 fn async_runtime_spawn_is_non_blocking() {
-    let runtime = AsyncHostRuntime::new("task-runtime-non-blocking")
-        .expect("创建 AsyncHostRuntime 失败");
+    let runtime =
+        AsyncHostRuntime::new("task-runtime-non-blocking").expect("创建 AsyncHostRuntime 失败");
 
     let script = r#"
       (async () => {
@@ -32,8 +32,8 @@ fn async_runtime_spawn_is_non_blocking() {
 
 #[test]
 fn async_runtime_stats_and_drop() {
-    let runtime = AsyncHostRuntime::new("task-runtime-stats-drop")
-        .expect("创建 AsyncHostRuntime 失败");
+    let runtime =
+        AsyncHostRuntime::new("task-runtime-stats-drop").expect("创建 AsyncHostRuntime 失败");
 
     let handle = runtime
         .spawn("(async () => { await new Promise(() => {}); return \"ok\"; })()")
@@ -54,8 +54,8 @@ fn async_runtime_runs_multiple_io_tasks_concurrently() {
     const DELAY_MS: u64 = 40;
 
     let (addr, shutdown_tx, handle) = spawn_delay_server(DELAY_MS);
-    let runtime = AsyncHostRuntime::new("task-runtime-concurrent-io")
-        .expect("创建 AsyncHostRuntime 失败");
+    let runtime =
+        AsyncHostRuntime::new("task-runtime-concurrent-io").expect("创建 AsyncHostRuntime 失败");
 
     let script = format!(
         r#"
@@ -98,8 +98,7 @@ fn async_runtime_supports_many_independent_rust_async_waiters() {
 
     let (addr, shutdown_tx, handle) = spawn_delay_server(DELAY_MS);
     let runtime = Arc::new(
-        AsyncHostRuntime::new("task-runtime-many-waiters")
-            .expect("创建 AsyncHostRuntime 失败"),
+        AsyncHostRuntime::new("task-runtime-many-waiters").expect("创建 AsyncHostRuntime 失败"),
     );
 
     let script = format!(
@@ -276,8 +275,14 @@ fn bundle_call_once_is_serialized_per_runtime() {
                 .await
         });
 
-        let out1 = task1.await.expect("task1 join 失败").expect("task1 执行失败");
-        let out2 = task2.await.expect("task2 join 失败").expect("task2 执行失败");
+        let out1 = task1
+            .await
+            .expect("task1 join 失败")
+            .expect("task1 执行失败");
+        let out2 = task2
+            .await
+            .expect("task2 join 失败")
+            .expect("task2 执行失败");
 
         assert_eq!(out1["ok"], true);
         assert_eq!(out2["ok"], true);
@@ -294,8 +299,8 @@ fn bundle_call_once_is_serialized_per_runtime() {
 
 #[test]
 fn async_runtime_drop_unblocks_pending_waiter() {
-    let runtime = AsyncHostRuntime::new("task-runtime-drop-unblock")
-        .expect("创建 AsyncHostRuntime 失败");
+    let runtime =
+        AsyncHostRuntime::new("task-runtime-drop-unblock").expect("创建 AsyncHostRuntime 失败");
     let handle = runtime
         .spawn(
             r#"

@@ -12,13 +12,13 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 #[cfg(feature = "wasi")]
 use std::collections::VecDeque;
-use std::future::Future;
 use std::fs;
+use std::future::Future;
 use std::io;
 use std::io::Read;
 use std::io::Write;
-use std::pin::Pin;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -285,9 +285,19 @@ static LOG_DROPPED: AtomicU64 = AtomicU64::new(0);
 static LOG_ERRORS: AtomicU64 = AtomicU64::new(0);
 static LOG_PENDING: AtomicU64 = AtomicU64::new(0);
 type BridgeRouteFuture = Pin<Box<dyn Future<Output = AnyResult<Value>> + Send + 'static>>;
-type BridgeRouteAsyncHandler = Arc<dyn Fn(String, Vec<Value>) -> BridgeRouteFuture + Send + Sync + 'static>;
+type BridgeRouteSyncHandler =
+    Arc<dyn Fn(String, Vec<Value>) -> AnyResult<Value> + Send + Sync + 'static>;
+type BridgeRouteAsyncHandler =
+    Arc<dyn Fn(String, Vec<Value>) -> BridgeRouteFuture + Send + Sync + 'static>;
+type BridgeRouteBlockingHandler =
+    Arc<dyn Fn(String, Vec<Value>) -> AnyResult<Value> + Send + Sync + 'static>;
+static BRIDGE_ROUTE_SYNC_HANDLERS: OnceLock<Mutex<HashMap<String, BridgeRouteSyncHandler>>> =
+    OnceLock::new();
 static BRIDGE_ROUTE_ASYNC_HANDLERS: OnceLock<Mutex<HashMap<String, BridgeRouteAsyncHandler>>> =
     OnceLock::new();
+static BRIDGE_ROUTE_BLOCKING_HANDLERS: OnceLock<
+    Mutex<HashMap<String, BridgeRouteBlockingHandler>>,
+> = OnceLock::new();
 
 struct PendingTask {
     rx: mpsc::Receiver<String>,
@@ -335,8 +345,52 @@ fn bridge_req_pool() -> &'static Mutex<HashMap<u64, PendingTask>> {
     BRIDGE_REQ_POOL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn bridge_route_sync_handler_cell() -> &'static Mutex<HashMap<String, BridgeRouteSyncHandler>> {
+    BRIDGE_ROUTE_SYNC_HANDLERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn bridge_route_async_handler_cell() -> &'static Mutex<HashMap<String, BridgeRouteAsyncHandler>> {
     BRIDGE_ROUTE_ASYNC_HANDLERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn bridge_route_blocking_handler_cell()
+-> &'static Mutex<HashMap<String, BridgeRouteBlockingHandler>> {
+    BRIDGE_ROUTE_BLOCKING_HANDLERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn normalize_bridge_route_name(name: impl Into<String>) -> AnyResult<String> {
+    let name = name.into().trim().to_string();
+    if name.is_empty() {
+        return Err(anyhow!("bridge 路由名不能为空"));
+    }
+    Ok(name)
+}
+
+pub fn register_bridge_route_sync_handler<F>(name: impl Into<String>, handler: F) -> AnyResult<()>
+where
+    F: Fn(String, Vec<Value>) -> AnyResult<Value> + Send + Sync + 'static,
+{
+    let name = normalize_bridge_route_name(name)?;
+    let wrapped = Arc::new(handler) as BridgeRouteSyncHandler;
+    {
+        let mut handlers = bridge_route_sync_handler_cell()
+            .lock()
+            .map_err(|_| anyhow!("bridge 同步路由表锁已损坏"))?;
+        handlers.insert(name.clone(), wrapped);
+    }
+    {
+        let mut handlers = bridge_route_async_handler_cell()
+            .lock()
+            .map_err(|_| anyhow!("bridge 异步路由表锁已损坏"))?;
+        handlers.remove(&name);
+    }
+    {
+        let mut handlers = bridge_route_blocking_handler_cell()
+            .lock()
+            .map_err(|_| anyhow!("bridge 阻塞路由表锁已损坏"))?;
+        handlers.remove(&name);
+    }
+    Ok(())
 }
 
 pub fn register_bridge_route_async_handler<F, Fut>(
@@ -347,40 +401,127 @@ where
     F: Fn(String, Vec<Value>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = AnyResult<Value>> + Send + 'static,
 {
-    let name = name.into().trim().to_string();
-    if name.is_empty() {
-        return Err(anyhow!("bridge 路由名不能为空"));
-    }
+    let name = normalize_bridge_route_name(name)?;
     let wrapped = Arc::new(move |runtime_name: String, args: Vec<Value>| {
         Box::pin(handler(runtime_name, args)) as BridgeRouteFuture
     }) as BridgeRouteAsyncHandler;
-    let mut handlers = bridge_route_async_handler_cell()
-        .lock()
-        .map_err(|_| anyhow!("bridge 异步路由表锁已损坏"))?;
-    handlers.insert(name, wrapped);
+    {
+        let mut handlers = bridge_route_async_handler_cell()
+            .lock()
+            .map_err(|_| anyhow!("bridge 异步路由表锁已损坏"))?;
+        handlers.insert(name.clone(), wrapped);
+    }
+    {
+        let mut handlers = bridge_route_sync_handler_cell()
+            .lock()
+            .map_err(|_| anyhow!("bridge 同步路由表锁已损坏"))?;
+        handlers.remove(&name);
+    }
+    {
+        let mut handlers = bridge_route_blocking_handler_cell()
+            .lock()
+            .map_err(|_| anyhow!("bridge 阻塞路由表锁已损坏"))?;
+        handlers.remove(&name);
+    }
+    Ok(())
+}
+
+pub fn register_bridge_route_blocking_handler<F>(
+    name: impl Into<String>,
+    handler: F,
+) -> AnyResult<()>
+where
+    F: Fn(String, Vec<Value>) -> AnyResult<Value> + Send + Sync + 'static,
+{
+    let name = normalize_bridge_route_name(name)?;
+    let wrapped = Arc::new(handler) as BridgeRouteBlockingHandler;
+    {
+        let mut handlers = bridge_route_blocking_handler_cell()
+            .lock()
+            .map_err(|_| anyhow!("bridge 阻塞路由表锁已损坏"))?;
+        handlers.insert(name.clone(), wrapped);
+    }
+    {
+        let mut handlers = bridge_route_sync_handler_cell()
+            .lock()
+            .map_err(|_| anyhow!("bridge 同步路由表锁已损坏"))?;
+        handlers.remove(&name);
+    }
+    {
+        let mut handlers = bridge_route_async_handler_cell()
+            .lock()
+            .map_err(|_| anyhow!("bridge 异步路由表锁已损坏"))?;
+        handlers.remove(&name);
+    }
     Ok(())
 }
 
 pub fn unregister_bridge_route_handler(name: &str) -> AnyResult<bool> {
+    let mut sync_handlers = bridge_route_sync_handler_cell()
+        .lock()
+        .map_err(|_| anyhow!("bridge 同步路由表锁已损坏"))?;
     let mut async_handlers = bridge_route_async_handler_cell()
         .lock()
         .map_err(|_| anyhow!("bridge 异步路由表锁已损坏"))?;
+    let mut blocking_handlers = bridge_route_blocking_handler_cell()
+        .lock()
+        .map_err(|_| anyhow!("bridge 阻塞路由表锁已损坏"))?;
+    let removed_sync = sync_handlers.remove(name).is_some();
     let removed_async = async_handlers.remove(name).is_some();
-    Ok(removed_async)
+    let removed_blocking = blocking_handlers.remove(name).is_some();
+    Ok(removed_sync || removed_async || removed_blocking)
 }
 
-async fn call_registered_bridge_route_async(
+fn call_registered_bridge_route_sync(
     runtime_name: String,
     name: String,
     args: Vec<Value>,
 ) -> AnyResult<Value> {
+    let sync_handler = bridge_route_sync_handler_cell()
+        .lock()
+        .map_err(|_| anyhow!("bridge 同步路由表锁已损坏"))?
+        .get(&name)
+        .cloned()
+        .ok_or_else(|| anyhow!("不支持的 bridge 方法: {name}"))?;
+    sync_handler(runtime_name, args)
+}
+
+async fn call_registered_bridge_route(
+    runtime_name: String,
+    name: String,
+    args: Vec<Value>,
+) -> AnyResult<Value> {
+    let sync_handler = bridge_route_sync_handler_cell()
+        .lock()
+        .map_err(|_| anyhow!("bridge 同步路由表锁已损坏"))?
+        .get(&name)
+        .cloned();
+    if let Some(sync_handler) = sync_handler {
+        return sync_handler(runtime_name, args);
+    }
+
     let async_handler = bridge_route_async_handler_cell()
         .lock()
         .map_err(|_| anyhow!("bridge 异步路由表锁已损坏"))?
         .get(&name)
-        .cloned()
-        .ok_or_else(|| anyhow!("不支持的 bridge 方法: {name}"))?;
-    async_handler(runtime_name, args).await
+        .cloned();
+    if let Some(async_handler) = async_handler {
+        return async_handler(runtime_name, args).await;
+    }
+
+    let blocking_handler = bridge_route_blocking_handler_cell()
+        .lock()
+        .map_err(|_| anyhow!("bridge 阻塞路由表锁已损坏"))?
+        .get(&name)
+        .cloned();
+    if let Some(blocking_handler) = blocking_handler {
+        return host_async_runtime()
+            .spawn_blocking(move || blocking_handler(runtime_name, args))
+            .await
+            .map_err(|err| anyhow!("bridge blocking 路由任务 join 失败: {err}"))?;
+    }
+
+    Err(anyhow!("不支持的 bridge 方法: {name}"))
 }
 
 fn http_req_event_pool() -> &'static Mutex<HashMap<u64, PendingAbortTask>> {
@@ -2625,7 +2766,7 @@ fn compression_gzip_compress(input: Vec<u8>) -> AnyResult<Value> {
 }
 
 fn bridge_call_inner(
-    _runtime_name: String,
+    runtime_name: String,
     name: String,
     args_json: Option<String>,
 ) -> AnyResult<Value> {
@@ -2685,7 +2826,7 @@ fn bridge_call_inner(
             let input = parse_u8_json_value(require_arg(&args, 0, "input")?)?;
             compression_gzip_compress(input)
         }
-        _ => Err(anyhow!("不支持的 bridge 方法: {name}")),
+        _ => call_registered_bridge_route_sync(runtime_name, name, args),
     }
 }
 
@@ -2750,7 +2891,7 @@ async fn bridge_call_inner_async(
             let input = parse_u8_json_value(require_arg(&args, 0, "input")?)?;
             compression_gzip_compress(input)
         }
-        _ => call_registered_bridge_route_async(runtime_name, name, args).await,
+        _ => call_registered_bridge_route(runtime_name, name, args).await,
     }
 }
 

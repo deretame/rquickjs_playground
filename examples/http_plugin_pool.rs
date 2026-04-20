@@ -48,7 +48,9 @@ impl PluginManager {
                 println!("http worker test1 getInfo: {info}");
 
                 while let Ok(job) = rx.recv() {
-                    let _ = job.reply_tx.send(invoke_one(&host, &job.name, &job.function, &job.args));
+                    let _ =
+                        job.reply_tx
+                            .send(invoke_one(&host, &job.name, &job.function, &job.args));
                 }
             });
         }
@@ -130,7 +132,12 @@ async fn invoke_handler(
     }
 }
 
-fn invoke_one(host: &AsyncHostRuntime, name: &str, function: &str, args: &Value) -> Result<Value, String> {
+fn invoke_one(
+    host: &AsyncHostRuntime,
+    name: &str,
+    function: &str,
+    args: &Value,
+) -> Result<Value, String> {
     let name_json = serde_json::to_string(name).map_err(|e| e.to_string())?;
     let function_json = serde_json::to_string(function).map_err(|e| e.to_string())?;
     let args_json = serde_json::to_string(args).map_err(|e| e.to_string())?;
@@ -148,7 +155,11 @@ fn invoke_one(host: &AsyncHostRuntime, name: &str, function: &str, args: &Value)
         "#
     );
 
-    let raw = host.spawn(&script).map_err(|e| e.to_string())?.wait().map_err(|e| e.to_string())?;
+    let raw = host
+        .spawn(&script)
+        .map_err(|e| e.to_string())?
+        .wait()
+        .map_err(|e| e.to_string())?;
     let payload: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     if payload.get("ok").and_then(Value::as_bool) == Some(true) {
         Ok(payload.get("data").cloned().unwrap_or(Value::Null))
@@ -161,7 +172,11 @@ fn invoke_one(host: &AsyncHostRuntime, name: &str, function: &str, args: &Value)
     }
 }
 
-fn get_plugin_info(host: &AsyncHostRuntime, plugin_name: &str, query: &Value) -> Result<Value, String> {
+fn get_plugin_info(
+    host: &AsyncHostRuntime,
+    plugin_name: &str,
+    query: &Value,
+) -> Result<Value, String> {
     let name_json = serde_json::to_string(plugin_name).map_err(|e| e.to_string())?;
     let query_json = serde_json::to_string(query).map_err(|e| e.to_string())?;
     let script = format!(
@@ -177,7 +192,11 @@ fn get_plugin_info(host: &AsyncHostRuntime, plugin_name: &str, query: &Value) ->
         "#
     );
 
-    let raw = host.spawn(&script).map_err(|e| e.to_string())?.wait().map_err(|e| e.to_string())?;
+    let raw = host
+        .spawn(&script)
+        .map_err(|e| e.to_string())?
+        .wait()
+        .map_err(|e| e.to_string())?;
     let payload: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     if payload.get("ok").and_then(Value::as_bool) == Some(true) {
         Ok(payload.get("data").cloned().unwrap_or(Value::Null))
@@ -295,7 +314,8 @@ async fn main() {
         }
     });
 
-    let url_json = serde_json::to_string(&format!("http://{addr}/invoke")).expect("序列化 URL 失败");
+    let url_json =
+        serde_json::to_string(&format!("http://{addr}/invoke")).expect("序列化 URL 失败");
 
     let script = format!(
         r#"
@@ -332,9 +352,12 @@ async fn main() {
     );
 
     let result = tokio::task::spawn_blocking(move || {
-        let host = AsyncHostRuntime::new("example-http-plugin-main")
-            .expect("创建 HostRuntime 失败");
-        host.spawn(&script).expect("执行 JS 请求失败").wait().expect("执行 JS 请求失败")
+        let host =
+            AsyncHostRuntime::new("example-http-plugin-main").expect("创建 HostRuntime 失败");
+        host.spawn(&script)
+            .expect("执行 JS 请求失败")
+            .wait()
+            .expect("执行 JS 请求失败")
     })
     .await
     .expect("等待 JS 任务失败");

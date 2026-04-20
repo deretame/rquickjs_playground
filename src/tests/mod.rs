@@ -8,11 +8,11 @@ pub mod task_runtime;
 pub use crate::web_runtime::{
     run_async_script, run_async_script_with_wasi, run_async_script_without_wasi,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::mpsc;
 use std::sync::OnceLock;
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use tiny_http::{Method as TinyMethod, Response, Server};
@@ -74,15 +74,16 @@ pub fn spawn_test_server_with_headers(
             match server.recv_timeout(Duration::from_millis(100)) {
                 Ok(Some(mut request)) => {
                     if request.url() == "/axios-binary" {
-                        let resp = Response::from_data(vec![0, 1, 2, 3, 250, 251, 252, 253, 254, 255])
-                            .with_status_code(200)
-                            .with_header(
-                                tiny_http::Header::from_bytes(
-                                    b"Content-Type".as_slice(),
-                                    b"application/octet-stream".as_slice(),
-                                )
-                                .expect("构造二进制响应头失败"),
-                            );
+                        let resp =
+                            Response::from_data(vec![0, 1, 2, 3, 250, 251, 252, 253, 254, 255])
+                                .with_status_code(200)
+                                .with_header(
+                                    tiny_http::Header::from_bytes(
+                                        b"Content-Type".as_slice(),
+                                        b"application/octet-stream".as_slice(),
+                                    )
+                                    .expect("构造二进制响应头失败"),
+                                );
                         let _ = request.respond(resp);
                         continue;
                     }

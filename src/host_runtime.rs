@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use tokio::sync::oneshot;
 use tokio::sync::OwnedMutexGuard;
+use tokio::sync::oneshot;
 
 use crate::web_runtime::{
     WebRuntimeOptions, http_request_drop_evented, http_request_start_evented,
@@ -232,9 +232,16 @@ pub struct RuntimeJsonTaskHandle<T> {
 }
 
 enum AsyncCommand {
-    Submit { id: u64, script: String },
-    Drop { id: u64 },
-    DropMany { ids: Vec<u64> },
+    Submit {
+        id: u64,
+        script: String,
+    },
+    Drop {
+        id: u64,
+    },
+    DropMany {
+        ids: Vec<u64>,
+    },
     RunGc {
         tx: oneshot::Sender<Result<(), String>>,
     },
@@ -407,8 +414,10 @@ impl AsyncHostRuntime {
         let (init_tx, init_rx) = mpsc::channel::<Result<(), String>>();
 
         thread::spawn(move || {
-            let host = match HostRuntime::new_with_options(cache_scope_id_for_worker, options_for_worker)
-            {
+            let host = match HostRuntime::new_with_options(
+                cache_scope_id_for_worker,
+                options_for_worker,
+            ) {
                 Ok(host) => host,
                 Err(err) => {
                     let _ = init_tx.send(Err(format!("初始化 HostRuntime 失败: {err}")));
@@ -640,10 +649,10 @@ impl AsyncHostRuntime {
 
     pub async fn bundle_load(&self, name: &str, source: &str) -> Result<(), String> {
         self.bundle_ensure_dispatcher().await?;
-        let name_literal = serde_json::to_string(name)
-            .map_err(|e| format!("序列化 bundle 名称失败: {e}"))?;
-        let source_literal = serde_json::to_string(source)
-            .map_err(|e| format!("序列化 bundle 脚本失败: {e}"))?;
+        let name_literal =
+            serde_json::to_string(name).map_err(|e| format!("序列化 bundle 名称失败: {e}"))?;
+        let source_literal =
+            serde_json::to_string(source).map_err(|e| format!("序列化 bundle 脚本失败: {e}"))?;
 
         let script = format!(
             r#"
@@ -743,8 +752,8 @@ impl AsyncHostRuntime {
 
     pub async fn bundle_unload(&self, name: &str) -> Result<bool, String> {
         self.bundle_ensure_dispatcher().await?;
-        let name_literal = serde_json::to_string(name)
-            .map_err(|e| format!("序列化 bundle 名称失败: {e}"))?;
+        let name_literal =
+            serde_json::to_string(name).map_err(|e| format!("序列化 bundle 名称失败: {e}"))?;
 
         let script = format!(
             r#"
@@ -959,7 +968,11 @@ where
     }
 }
 
-fn build_bundle_call_once_script(source: &str, fn_path: &str, args: &Value) -> Result<String, String> {
+fn build_bundle_call_once_script(
+    source: &str,
+    fn_path: &str,
+    args: &Value,
+) -> Result<String, String> {
     let source_literal =
         serde_json::to_string(source).map_err(|e| format!("序列化 bundle 脚本失败: {e}"))?;
     let fn_path_literal =

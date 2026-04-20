@@ -141,19 +141,25 @@ fn fetch_post_formdata_body() {
     let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
 
     assert_eq!(parsed["method"], "POST");
-    assert!(parsed["contentType"]
-        .as_str()
-        .unwrap_or("")
-        .contains("multipart/form-data; boundary="));
-    assert!(parsed["body"]
-        .as_str()
-        .unwrap_or("")
-        .contains("name=\"name\""));
+    assert!(
+        parsed["contentType"]
+            .as_str()
+            .unwrap_or("")
+            .contains("multipart/form-data; boundary=")
+    );
+    assert!(
+        parsed["body"]
+            .as_str()
+            .unwrap_or("")
+            .contains("name=\"name\"")
+    );
     assert!(parsed["body"].as_str().unwrap_or("").contains("quickjs"));
-    assert!(parsed["body"]
-        .as_str()
-        .unwrap_or("")
-        .contains("name=\"lang\""));
+    assert!(
+        parsed["body"]
+            .as_str()
+            .unwrap_or("")
+            .contains("name=\"lang\"")
+    );
     assert!(parsed["body"].as_str().unwrap_or("").contains("rust"));
 
     let _ = tx.send(());
@@ -190,10 +196,12 @@ fn fetch_post_formdata_file_fields() {
     let parsed: Value = serde_json::from_str(&result).expect("解析结果失败");
 
     assert_eq!(parsed["method"], "POST");
-    assert!(parsed["contentType"]
-        .as_str()
-        .unwrap_or("")
-        .contains("multipart/form-data; boundary="));
+    assert!(
+        parsed["contentType"]
+            .as_str()
+            .unwrap_or("")
+            .contains("multipart/form-data; boundary=")
+    );
 
     let body = parsed["body"].as_str().unwrap_or("");
     assert!(body.contains("name=\"upload\"; filename=\"greeting.txt\""));
@@ -269,10 +277,12 @@ fn fetch_headers() {
 
     assert_eq!(parsed["status"], 200);
     assert_eq!(parsed["hasContentType"], true);
-    assert!(parsed["contentType"]
-        .as_str()
-        .unwrap_or("")
-        .contains("application/json"));
+    assert!(
+        parsed["contentType"]
+            .as_str()
+            .unwrap_or("")
+            .contains("application/json")
+    );
 
     let _ = tx.send(());
     let _ = handle.join();

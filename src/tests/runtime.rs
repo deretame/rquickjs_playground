@@ -511,4 +511,3 @@ fn runtime_runs_compiled_pnpm_bundle() {
     assert_eq!(parsed["out"][3], 4);
     assert_eq!(parsed["wasi"]["exitCode"], 0);
 }
-
