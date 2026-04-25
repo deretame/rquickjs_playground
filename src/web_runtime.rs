@@ -19,6 +19,8 @@ use std::io::Read;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+#[cfg(target_os = "macos")]
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -30,6 +32,8 @@ use hmac::{Hmac, Mac};
 use reqwest::multipart::{Form as MultipartForm, Part as MultipartPart};
 use reqwest::{Client, Method, Proxy};
 use sha2::{Digest, Sha256};
+#[cfg(windows)]
+use windows_registry::CURRENT_USER;
 
 use filetime::{FileTime, set_file_times};
 use rquickjs::{Ctx, Function, Promise, function::Func};
@@ -263,8 +267,7 @@ static WASI_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 static WASI_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "wasi")]
 static WASI_CACHE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
-static HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
-static HTTP_CLIENT_CONFIG: OnceLock<Mutex<HttpClientConfig>> = OnceLock::new();
+static HTTP_CLIENT_STATE: OnceLock<Mutex<HttpClientState>> = OnceLock::new();
 static HOST_ASYNC_RT: OnceLock<TokioRuntime> = OnceLock::new();
 static HTTP_IO_SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static FS_IO_SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
@@ -298,6 +301,7 @@ static BRIDGE_ROUTE_ASYNC_HANDLERS: OnceLock<Mutex<HashMap<String, BridgeRouteAs
 static BRIDGE_ROUTE_BLOCKING_HANDLERS: OnceLock<
     Mutex<HashMap<String, BridgeRouteBlockingHandler>>,
 > = OnceLock::new();
+const HTTP_SYSTEM_PROXY_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 
 struct PendingTask {
     rx: mpsc::Receiver<String>,
@@ -310,7 +314,7 @@ struct PendingAbortTask {
     created_at: Instant,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpClientConfig {
     pub use_http_proxy: bool,
     pub use_socks5_proxy: bool,
@@ -327,6 +331,26 @@ impl Default for HttpClientConfig {
             http_proxy: None,
             socks5_proxy: None,
             disable_tls_verify: false,
+        }
+    }
+}
+
+struct HttpClientState {
+    client: Option<Client>,
+    config: HttpClientConfig,
+    auto_system_proxy: bool,
+    system_proxy_fingerprint: Option<String>,
+    last_system_proxy_check_at: Option<Instant>,
+}
+
+impl Default for HttpClientState {
+    fn default() -> Self {
+        Self {
+            client: None,
+            config: HttpClientConfig::default(),
+            auto_system_proxy: false,
+            system_proxy_fingerprint: None,
+            last_system_proxy_check_at: None,
         }
     }
 }
@@ -1083,27 +1107,26 @@ fn host_async_runtime() -> &'static TokioRuntime {
     })
 }
 
-fn http_client_config_cell() -> &'static Mutex<HttpClientConfig> {
-    HTTP_CLIENT_CONFIG.get_or_init(|| Mutex::new(HttpClientConfig::default()))
+fn http_client_state_cell() -> &'static Mutex<HttpClientState> {
+    HTTP_CLIENT_STATE.get_or_init(|| Mutex::new(HttpClientState::default()))
 }
 
 pub fn configure_http_client(config: HttpClientConfig) -> AnyResult<()> {
-    if HTTP_CLIENT.get().is_some() {
-        return Err(anyhow!(
-            "HTTP client 已初始化，无法更新配置；请在首次请求前配置或重启进程"
-        ));
-    }
-    let mut guard = http_client_config_cell()
+    let mut state = http_client_state_cell()
         .lock()
-        .map_err(|_| anyhow!("HTTP client 配置锁已损坏"))?;
-    *guard = config;
+        .map_err(|_| anyhow!("HTTP client 状态锁已损坏"))?;
+    state.client = None;
+    state.auto_system_proxy = false;
+    state.system_proxy_fingerprint = None;
+    state.last_system_proxy_check_at = None;
+    state.config = config;
     Ok(())
 }
 
 pub fn current_http_client_config() -> HttpClientConfig {
-    http_client_config_cell()
+    http_client_state_cell()
         .lock()
-        .map(|guard| guard.clone())
+        .map(|state| state.config.clone())
         .unwrap_or_default()
 }
 
@@ -1123,26 +1146,24 @@ fn normalize_socks5_proxy_url(raw: &str) -> String {
     format!("socks5h://{value}")
 }
 
-fn http_client() -> AnyResult<&'static Client> {
-    if let Some(client) = HTTP_CLIENT.get() {
-        return Ok(client);
-    }
-
+fn build_http_client(config: &HttpClientConfig) -> AnyResult<(Client, bool)> {
     let mut builder = Client::builder().timeout(Duration::from_secs(30));
+    let mut has_explicit_proxy = false;
 
-    let config = current_http_client_config();
     if config.use_http_proxy {
         if let Some(proxy_raw) = config.http_proxy.as_deref() {
             let proxy_url = normalize_http_proxy_url(proxy_raw);
             let proxy = Proxy::all(&proxy_url)
                 .with_context(|| format!("解析 HTTP 代理地址失败: {proxy_url}"))?;
             builder = builder.proxy(proxy);
+            has_explicit_proxy = true;
         } else if config.use_socks5_proxy {
             if let Some(proxy_raw) = config.socks5_proxy.as_deref() {
                 let proxy_url = normalize_socks5_proxy_url(proxy_raw);
                 let proxy = Proxy::all(&proxy_url)
                     .with_context(|| format!("解析 socks5 代理地址失败: {proxy_url}"))?;
                 builder = builder.proxy(proxy);
+                has_explicit_proxy = true;
             }
         }
     } else if config.use_socks5_proxy {
@@ -1151,6 +1172,7 @@ fn http_client() -> AnyResult<&'static Client> {
             let proxy = Proxy::all(&proxy_url)
                 .with_context(|| format!("解析 socks5 代理地址失败: {proxy_url}"))?;
             builder = builder.proxy(proxy);
+            has_explicit_proxy = true;
         }
     }
 
@@ -1163,12 +1185,101 @@ fn http_client() -> AnyResult<&'static Client> {
     }
 
     let client = builder.build().context("创建 HTTP client 失败")?;
+    Ok((client, !has_explicit_proxy))
+}
 
-    match HTTP_CLIENT.set(client) {
-        Ok(()) => Ok(HTTP_CLIENT.get().expect("HTTP client 初始化后必须可读取")),
-        Err(_client) => Ok(HTTP_CLIENT
-            .get()
-            .expect("HTTP client 并发初始化后必须可读取")),
+fn env_var_or_empty(name: &str) -> String {
+    std::env::var(name).unwrap_or_default()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_system_proxy_fingerprint() -> Option<String> {
+    let out = Command::new("scutil").arg("--proxy").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+#[cfg(windows)]
+fn windows_internet_settings_fingerprint() -> Option<String> {
+    let key = CURRENT_USER
+        .open("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings")
+        .ok()?;
+    let proxy_enable = key.get_u32("ProxyEnable").unwrap_or(0);
+    let proxy_server = key.get_string("ProxyServer").unwrap_or_default();
+    let auto_config_url = key.get_string("AutoConfigURL").unwrap_or_default();
+    let auto_detect = key.get_u32("AutoDetect").unwrap_or(0);
+    Some(format!(
+        "proxyEnable={proxy_enable};proxyServer={proxy_server};autoConfigUrl={auto_config_url};autoDetect={auto_detect}"
+    ))
+}
+
+fn current_system_proxy_fingerprint() -> Option<String> {
+    let env_fingerprint = format!(
+        "ALL_PROXY={};all_proxy={};HTTP_PROXY={};http_proxy={};HTTPS_PROXY={};https_proxy={};NO_PROXY={};no_proxy={}",
+        env_var_or_empty("ALL_PROXY"),
+        env_var_or_empty("all_proxy"),
+        env_var_or_empty("HTTP_PROXY"),
+        env_var_or_empty("http_proxy"),
+        env_var_or_empty("HTTPS_PROXY"),
+        env_var_or_empty("https_proxy"),
+        env_var_or_empty("NO_PROXY"),
+        env_var_or_empty("no_proxy")
+    );
+    #[cfg(windows)]
+    {
+        let win_fingerprint = windows_internet_settings_fingerprint().unwrap_or_default();
+        return Some(format!("{env_fingerprint};{win_fingerprint}"));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mac_fingerprint = macos_system_proxy_fingerprint().unwrap_or_default();
+        return Some(format!("{env_fingerprint};{mac_fingerprint}"));
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        Some(env_fingerprint)
+    }
+}
+
+fn http_client() -> AnyResult<Client> {
+    let now = Instant::now();
+    let mut state = http_client_state_cell()
+        .lock()
+        .map_err(|_| anyhow!("HTTP client 状态锁已损坏"))?;
+    let config = state.config.clone();
+    let mut need_rebuild = state.client.is_none();
+    if state.auto_system_proxy {
+        let need_check = state
+            .last_system_proxy_check_at
+            .map(|last| now.saturating_duration_since(last) >= HTTP_SYSTEM_PROXY_REFRESH_INTERVAL)
+            .unwrap_or(true);
+        if need_check {
+            let fingerprint = current_system_proxy_fingerprint();
+            if state.system_proxy_fingerprint != fingerprint {
+                need_rebuild = true;
+            }
+            state.system_proxy_fingerprint = fingerprint;
+            state.last_system_proxy_check_at = Some(now);
+        }
+    }
+    if need_rebuild {
+        let (client, auto_system_proxy) = build_http_client(&config)?;
+        state.client = Some(client);
+        state.config = config;
+        state.auto_system_proxy = auto_system_proxy;
+        if auto_system_proxy {
+            state.system_proxy_fingerprint = current_system_proxy_fingerprint();
+            state.last_system_proxy_check_at = Some(now);
+        } else {
+            state.system_proxy_fingerprint = None;
+            state.last_system_proxy_check_at = None;
+        }
+    }
+    match state.client.clone() {
+        Some(client) => Ok(client),
+        None => Err(anyhow!("HTTP client 不可用")),
     }
 }
 
