@@ -1146,6 +1146,14 @@ fn normalize_socks5_proxy_url(raw: &str) -> String {
     format!("socks5h://{value}")
 }
 
+fn supports_auto_system_proxy() -> bool {
+    cfg!(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "linux"
+    ))
+}
+
 fn build_http_client(config: &HttpClientConfig) -> AnyResult<(Client, bool)> {
     let mut builder = Client::builder().timeout(Duration::from_secs(30));
     let mut has_explicit_proxy = false;
@@ -1184,8 +1192,13 @@ fn build_http_client(config: &HttpClientConfig) -> AnyResult<(Client, bool)> {
         }
     }
 
+    let auto_system_proxy = !has_explicit_proxy && supports_auto_system_proxy();
+    if !has_explicit_proxy && !auto_system_proxy {
+        builder = builder.no_proxy();
+    }
+
     let client = builder.build().context("创建 HTTP client 失败")?;
-    Ok((client, !has_explicit_proxy))
+    Ok((client, auto_system_proxy))
 }
 
 fn env_var_or_empty(name: &str) -> String {
